@@ -360,6 +360,47 @@ describePostgres("heartbeat recovery module ownership", () => {
     } finally { control.finish(); await deleteShutdownSource(f); await db.delete(environments).where(eq(environments.id, environment.id)); }
   });
 
+  it.each(["ephemeral", "reuse_by_environment"] as const)("recovers failed ordinary cleanup of a fenced %s source", async leasePolicy => {
+    const f = await seedShutdownSource();
+    const stop = vi.fn(async () => ({ providerLeaseId: f.lease.providerLeaseId, state: "stopped" }));
+    const destroy = vi.fn(async () => null);
+    const runtime = environmentRuntimeService(db, { drivers: [{ driver: "sandbox", resolveCapabilities: async () => classifyEnvironmentCapabilities({}),
+      acquireRunLease: async () => { throw new Error("Unexpected acquire"); }, releaseRunLease: destroy, destroyRunLease: destroy,
+      retryPendingSandboxTeardown: stop }] });
+    try {
+      await db.update(heartbeatRuns).set({ status: "interrupted", finishedAt: new Date(), contextSnapshot: { issueId: f.run.issueId } }).where(eq(heartbeatRuns.id, f.run.id));
+      await db.update(environmentLeases).set({ status: "pending_cleanup", leasePolicy, cleanupStatus: "failed",
+        releasedAt: new Date(), failureReason: "release_cleanup_failed" }).where(eq(environmentLeases.id, f.lease.id));
+      const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      expect(await allowLegacyShutdownWorkspaceCleanup(db, source, new Date(Date.now() + 60_000))).toBe(true);
+      const lease = (await environmentService(db).getLeaseById(f.lease.id))!;
+      expect(lease).toMatchObject({ status: "pending_cleanup", leasePolicy: "retain_on_failure", metadata: {
+        legacyShutdownWorkspaceSettlement: { state: "expired" }, sandboxStopAndRetain: { leaseId: f.lease.id } } });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0].resultJson)
+        .toMatchObject({ workspaceRestoreRecovery: { leaseIds: [f.lease.id] } });
+      const deps = callbacks(db); deps.environmentRuntime = runtime;
+      expect(await createHeartbeatRecovery(db, deps).sweepPendingCleanupLeases({ backoffMs: 0 })).toMatchObject({ destroyed: 1 });
+      expect((await environmentService(db).getLeaseById(f.lease.id))!).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(stop).toHaveBeenCalledOnce(); expect(destroy).not.toHaveBeenCalled();
+    } finally { await deleteShutdownSource(f); }
+  });
+
+  it("waits for a claimed ordinary cleanup attempt before converting its shutdown source", async () => {
+    const f = await seedShutdownSource(); const expiresAt = Date.now() + 120_000;
+    try {
+      await db.update(heartbeatRuns).set({ status: "interrupted", finishedAt: new Date(), contextSnapshot: { issueId: f.run.issueId } }).where(eq(heartbeatRuns.id, f.run.id));
+      const [marked] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed", releasedAt: new Date(),
+        metadata: { ...marked.metadata, pendingCleanupInFlight: true, pendingCleanupLeaseExpiresAtMs: expiresAt } }).where(eq(environmentLeases.id, f.lease.id));
+      const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      expect(await allowLegacyShutdownWorkspaceCleanup(db, source, new Date(expiresAt - 1))).toBe(false);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0].resultJson?.workspaceRestoreRecovery).toBeUndefined();
+      expect(await allowLegacyShutdownWorkspaceCleanup(db, source, new Date(expiresAt + 1))).toBe(true);
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0])
+        .toMatchObject({ status: "pending_cleanup", metadata: { sandboxStopAndRetain: { leaseId: f.lease.id } } });
+    } finally { await deleteShutdownSource(f); }
+  });
+
   it("retries lease release when ordinary completion wins the shutdown status race", async () => {
     const f = await seedShutdownSource(); const control = createAdapterExecutionControl();
     adapterExecutionControls.set(f.run.id, control);

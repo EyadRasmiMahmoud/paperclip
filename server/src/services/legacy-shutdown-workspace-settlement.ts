@@ -97,7 +97,7 @@ export async function allowLegacyShutdownWorkspaceCleanup(db: Db, lease: Lease, 
     if (current.status !== "active") {
       const { hasConfirmedSandboxStopAndRetain, readStopOnlyCleanup } = await import("./sandbox-stop-and-retain.js");
       if (!(current.status === "released" && hasConfirmedSandboxStopAndRetain(current))
-        && !(current.status === "pending_cleanup" && readStopOnlyCleanup(current))) return false;
+        && current.status !== "pending_cleanup") return false;
       // The shutdown marker was committed on this exact active source before
       // cancellation. A stop receipt does not certify the later file export.
       const [competing] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
@@ -107,11 +107,21 @@ export async function allowLegacyShutdownWorkspaceCleanup(db: Db, lease: Lease, 
           gt(environmentLeases.acquiredAt, current.acquiredAt)),
       )).limit(1);
       if (competing) return false;
-      await tx.update(environmentLeases).set({ leasePolicy: "retain_on_failure",
-        metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ workspaceRestoreRecovery: {
-          schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, runId: run.id,
-        } })}::jsonb`,
-      }).where(eq(environmentLeases.id, current.id));
+      if (current.status === "pending_cleanup" && !readStopOnlyCleanup(current)) {
+        const expiresAt = current.metadata?.pendingCleanupLeaseExpiresAtMs;
+        if (current.metadata?.pendingCleanupInFlight === true
+          && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt > now.getTime())) return false;
+        // A failed ordinary release can race the shutdown marker. Re-enter the
+        // recorder's active-source path within this claim transaction so it
+        // replaces destructive retry with an exact stop-only recovery intent.
+        await tx.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, current.id));
+      } else {
+        await tx.update(environmentLeases).set({ leasePolicy: "retain_on_failure",
+          metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ workspaceRestoreRecovery: {
+            schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, runId: run.id,
+          } })}::jsonb`,
+        }).where(eq(environmentLeases.id, current.id));
+      }
     }
     const { terminalizeLegacyExecution } = await import("./legacy-execution-recovery.js");
     const preserved = await terminalizeLegacyExecution({ db: tx as unknown as Db, run, status: run.status,

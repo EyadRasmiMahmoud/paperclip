@@ -4,6 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { isWorkspacePackage, parseWorkspaceEntries } from '../build-standalone-public-packages.mjs';
 import { GROK_PUBLIC_INSTALL_IMAGE, GROK_PUBLIC_INSTALL_LIFECYCLE, assertInstalledCodexPlatformProvenance, assertNoBundledCodexPayloads, grokConsumerDockerArgs, installedCodexProbeSource } from '../grok-public-install-sandbox.mjs';
 
 const paths = { assets: '/private/staging/assets', consumer: '/private/staging/consumer', cache: '/private/staging/cache', uid: 1001, gid: 1001 };
@@ -139,9 +141,42 @@ test('the bundled-dependency installs run together while the other packages are 
   assert.ok(source.includes("destination: join(root, `pack-${index}`)"), 'each pack writes into its own directory');
   // The timing line reports the split staging phase, each install, and the
   // pack step with what the packs would have cost one after another.
-  for (const key of ['stage_sources_ms', 'stage_bundled_ms', 'stage_pack_ms', 'stage_pack_check_ms']) assert.ok(source.includes(`timing.${key} =`));
+  for (const key of ['stage_ui_dist_ms', 'stage_sources_ms', 'stage_bundled_ms', 'stage_pack_ms', 'stage_pack_check_ms']) assert.ok(source.includes(`timing.${key} =`));
   assert.ok(source.includes('...bundledInstallTimings(installs)'));
   assert.ok(source.includes('Object.assign(timing, packTimings(packs, concurrency))'));
+});
+
+test('the verifier stages only workspace packages, so it skips the standalone build release.sh needs', () => {
+  const source = readFileSync(new URL('../verify-grok-npm-install.mjs', import.meta.url), 'utf8');
+  const position = fragment => { const index = source.indexOf(fragment); assert.notEqual(index, -1, `verifier must contain ${fragment}`); return index; };
+  // The standalone public packages are the ones outside the pnpm workspace
+  // (the sandbox-provider plugins). release.sh builds them because it publishes
+  // them; the verifier packs only the closure of the server and the CLI under
+  // `workspace:` specs, and a `workspace:` spec can only name a workspace
+  // package, so no tarball here ever contains or depends on a standalone build.
+  assert.doesNotMatch(source, /build-standalone-public-packages/);
+  const repo = new URL('../../', import.meta.url);
+  const listing = spawnSync(process.execPath, [fileURLToPath(new URL('scripts/release-package-map.mjs', repo)), 'list'], { cwd: fileURLToPath(repo), encoding: 'utf8' });
+  assert.equal(listing.status, 0, listing.stderr);
+  const packages = new Map(listing.stdout.trim().split('\n').map(line => line.split('\t')).map(([dir, name]) => [name, { dir, manifest: JSON.parse(readFileSync(new URL(`${dir}/package.json`, repo), 'utf8')) }]));
+  const needed = new Set();
+  const visit = name => {
+    if (needed.has(name)) return;
+    const entry = packages.get(name); assert.ok(entry, `missing public workspace dependency ${name}`); needed.add(name);
+    for (const [dep, spec] of Object.entries({ ...entry.manifest.dependencies, ...entry.manifest.optionalDependencies })) if (spec.startsWith('workspace:')) visit(dep);
+  };
+  assert.ok(source.includes("visit('@paperclipai/server');\n  visit('paperclipai');"));
+  visit('@paperclipai/server'); visit('paperclipai');
+  const workspace = parseWorkspaceEntries(readFileSync(new URL('pnpm-workspace.yaml', repo), 'utf8'));
+  const standalone = [...packages.values()].filter(({ dir }) => !isWorkspacePackage(dir, workspace)).map(({ dir }) => dir);
+  assert.ok(standalone.length > 0, 'the public package map must still carry standalone packages for this check to mean anything');
+  for (const name of needed) assert.ok(isWorkspacePackage(packages.get(name).dir, workspace), `${name} is staged by the verifier but is not a workspace package`);
+  // The server publishes `ui-dist`, so that copy stays, before any package is
+  // staged, reusing the UI that `pnpm build` produced, and it is timed.
+  assert.deepEqual(JSON.parse(readFileSync(new URL('server/package.json', repo), 'utf8')).files, ['dist', 'ui-dist', 'skills']);
+  assert.ok(source.includes("PAPERCLIP_RELEASE_REUSE_UI_DIST: '1'"));
+  const uiDist = position("run('bash', [join(repo, 'scripts/prepare-server-ui-dist.sh')], repo)");
+  assert.ok(position("visit('paperclipai')") < uiDist && uiDist < position('timing.stage_ui_dist_ms =') && uiDist < position('const stageSource = '));
 });
 
 test('the installed Codex probe exercises the public export and rejects incomplete or mismatched packages', () => {

@@ -1234,22 +1234,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           await finishLegacyShutdownWorkspaceSettlement(db, run);
         } catch {
           logger.warn({ runId: run.id }, "Shutdown adapter settlement timed out; retaining the sandbox through normal cleanup");
-          const [sandbox] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+          const sources = await db.select().from(environmentLeases).where(and(
             eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
-            eq(environmentLeases.status, "active"), ne(environmentLeases.provider, "local"),
-            or(sql`${environmentLeases.metadata}->>'driver' = 'sandbox'`,
-              sql`${environmentLeases.metadata}->>'sandboxProviderPlugin' = 'true'`),
-          )).limit(1);
-          if (sandbox) {
-            // An unjoined restore cannot certify saved files. Record the exact
-            // stop-only sources and repair hold before provider cleanup starts.
-            const current = await getRun(run.id, { includeExecutionEvidence: true });
-            if (current) {
-              const preserved = await terminalizeLegacyExecution({ db, run: current, status: current.status,
-                recordRestoreFailureOnly: true, patch: { resultJson: { workspaceRestoreFailure: "restore_failed" } } });
-              if (preserved) await finishLegacyShutdownWorkspaceSettlement(db, run, "expired");
-            }
-          }
+            sql`${environmentLeases.metadata}->'legacyShutdownWorkspaceSettlement'->>'state' = 'pending'`,
+          ));
+          // Stop-only settlement can already have released the source. Claim
+          // its current fence and pin recovery before classifying or retrying.
+          for (const source of sources) await allowLegacyShutdownWorkspaceCleanup(db, source,
+            new Date(Math.max(Date.now(), settlementDeadline.getTime())));
           if (runningProcesses.get(run.id) === running && running) {
             await terminateHeartbeatRunProcess({ pid: running.child.pid, processGroupId: running.processGroupId,
               graceMs: Math.max(1, running.graceSec) * 1000 });

@@ -285,14 +285,26 @@ async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
 // concurrent builder either wins the rename or discards its copy and uses the
 // winner's; a template that exists is always complete.
 //
+// A template is a Postgres data directory, and starting one executes its
+// configuration (for example `shared_preload_libraries`). The cache root is
+// therefore private to the current OS user: its name carries the user id, it
+// is created with mode 0700, and it is only used when it is a real directory
+// (not a symlink) owned by this user with no group or world write bit. Each
+// template is checked the same way before it is copied. On a host with a
+// shared temp directory another user can pre-create the predictable path, and
+// those checks reject it. Windows has no uid; its temp directory is already
+// per user, so the ownership and mode checks are skipped there.
+//
 // Set PAPERCLIP_TEST_POSTGRES_TEMPLATE=0 to bypass the cache and run the fresh
-// path for every suite. Any failure on the template path (copy, start, or
-// publish) falls back to the fresh path, so a broken cache cannot fail a suite
-// that would otherwise pass.
+// path for every suite. Any failure on the template path (root checks, build,
+// copy, start, or publish) falls back to the fresh path, so a broken cache can
+// make a suite slower but never fail it or skip it: the fresh path still
+// reports a migration that cannot apply or a cluster that cannot start.
 // ---------------------------------------------------------------------------
 
 const TEMPLATE_ROOT_DIR_NAME = "paperclip-embedded-postgres-templates";
-// Templates whose key no longer matches are pruned once they are this old.
+// Templates whose key no longer matches are pruned once they have not been
+// used for this long. Every reuse refreshes the template's timestamp.
 const TEMPLATE_PRUNE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 // Publishing a template requires the builder cluster to have exited for real,
 // so its data files are quiescent before the rename. Give that stop more room
@@ -347,16 +359,106 @@ export function computeEmbeddedPostgresTemplateKey(
   return hash.digest("hex").slice(0, 24);
 }
 
-function templateRootDir(): string {
-  return path.join(os.tmpdir(), TEMPLATE_ROOT_DIR_NAME);
+// The uid on POSIX, else the user name. Part of the cache root's name so two
+// users on one host never share a root.
+function templateOwnerTag(): string {
+  const uid = process.getuid?.();
+  if (uid !== undefined) return String(uid);
+  let username = "user";
+  try {
+    username = os.userInfo().username;
+  } catch {
+    // Fall through to the generic tag.
+  }
+  return username.replace(/[^A-Za-z0-9_.-]/g, "_");
 }
 
-function isCompleteTemplate(dir: string): boolean {
+function templateRootDir(): string {
+  return path.join(os.tmpdir(), `${TEMPLATE_ROOT_DIR_NAME}-${templateOwnerTag()}`);
+}
+
+// Why `dir` cannot be trusted as a private directory of the current user, or
+// null when it can. Uses `lstat` so a symlink planted at the path is rejected
+// rather than followed. On Windows (no uid) only the directory check applies.
+function describePrivateDirectoryProblem(dir: string): string | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(dir);
+  } catch (error) {
+    return `cannot be inspected (${(error as NodeJS.ErrnoException).code ?? "unknown error"})`;
+  }
+  if (stat.isSymbolicLink()) return "is a symbolic link";
+  if (!stat.isDirectory()) return "is not a directory";
+  const uid = process.getuid?.();
+  if (uid === undefined) return null;
+  if (stat.uid !== uid) return `is owned by uid ${stat.uid}, not the current user (uid ${uid})`;
+  if ((stat.mode & 0o022) !== 0) {
+    return `is writable by group or others (mode ${(stat.mode & 0o777).toString(8)})`;
+  }
+  return null;
+}
+
+// Creates the cache root with mode 0700 and verifies it is private to the
+// current user. Returns null, after one warning, when it is not: the cache is
+// then unused for this process and every suite takes the fresh path.
+function prepareTemplateRootDir(): string | null {
+  const rootDir = templateRootDir();
+  try {
+    fs.mkdirSync(rootDir, { recursive: true, mode: 0o700 });
+    const problem = describePrivateDirectoryProblem(rootDir);
+    if (problem !== null) {
+      warnTemplateOnce("root", `template cache root ${rootDir} ${problem}; using fresh clusters`);
+      return null;
+    }
+    // A root created by an earlier version may be wider than 0700. It is
+    // ours (checked above), so narrow it.
+    if (process.getuid !== undefined && (fs.lstatSync(rootDir).mode & 0o777) !== 0o700) {
+      fs.chmodSync(rootDir, 0o700);
+    }
+    return rootDir;
+  } catch (error) {
+    warnTemplateOnce(
+      "root",
+      `template cache root ${rootDir} could not be prepared: ${(error as Error).message}; using fresh clusters`,
+    );
+    return null;
+  }
+}
+
+// A template is usable when it is a private directory of the current user
+// that holds a cleanly stopped cluster: `PG_VERSION` present, no
+// `postmaster.pid`. The ownership check repeats the root's check so a
+// template is never copied from a directory this user does not own.
+function isUsableTemplate(dir: string): boolean {
+  if (describePrivateDirectoryProblem(dir) !== null) return false;
   return fs.existsSync(path.join(dir, "PG_VERSION")) && !fs.existsSync(path.join(dir, "postmaster.pid"));
 }
 
-// Best-effort removal of templates for other keys that have not been touched
-// for a week, plus abandoned build directories. Never throws.
+// Records a use of the template so `pruneStaleTemplates` measures idle time,
+// not age. Best effort.
+function touchTemplate(dir: string): void {
+  try {
+    const now = new Date();
+    fs.utimesSync(dir, now, now);
+  } catch {
+    // The template still works without the refreshed timestamp.
+  }
+}
+
+const warnedTemplateTopics = new Set<string>();
+
+function warnTemplateOnce(topic: string, message: string): void {
+  if (warnedTemplateTopics.has(topic)) return;
+  warnedTemplateTopics.add(topic);
+  console.warn(`[embedded-postgres] ${message}`);
+}
+
+// Best-effort removal of templates for other keys that have not been used for
+// a week, plus abandoned build directories. Every reuse refreshes a template's
+// timestamp, so a template that any process resolved in the last week stays.
+// A suite never depends on the template after its copy is made, so pruning
+// can only affect a process that resolved the path and has not copied yet;
+// that process then rebuilds the template instead of failing. Never throws.
 function pruneStaleTemplates(rootDir: string, keepDir: string): void {
   let entries: fs.Dirent[];
   try {
@@ -395,13 +497,11 @@ async function stopForTemplatePublish(instance: EmbeddedPostgresInstance): Promi
 }
 
 // Builds a migrated cluster and publishes its data directory at `templateDir`.
-// Throws the fresh-path error if the cluster cannot start at all, so the probe
-// can report the real reason on an unsupported host. Returns false when the
-// cluster started but the template could not be published; callers then use
-// the fresh path for this process.
+// Throws when the cluster cannot start or a migration cannot apply. Returns
+// false when the cluster started but the template could not be published;
+// callers then use the fresh path for this process.
 async function buildEmbeddedPostgresTemplate(templateDir: string): Promise<boolean> {
   const rootDir = path.dirname(templateDir);
-  fs.mkdirSync(rootDir, { recursive: true });
   const { port, dataDir, instance } = await startEmbeddedPostgresWithRetry(
     "paperclip-embedded-postgres-template-build-",
   );
@@ -410,7 +510,7 @@ async function buildEmbeddedPostgresTemplate(templateDir: string): Promise<boole
     await ensurePostgresDatabase(adminConnectionStringFor(port), "paperclip");
     await applyPendingMigrations(databaseConnectionStringFor(port));
     const stopped = await stopForTemplatePublish(instance);
-    if (!stopped || !isCompleteTemplate(dataDir)) return false;
+    if (!stopped || !isUsableTemplate(dataDir)) return false;
     try {
       fs.renameSync(dataDir, templateDir);
       published = true;
@@ -418,7 +518,7 @@ async function buildEmbeddedPostgresTemplate(templateDir: string): Promise<boole
       // Another process published the same key first. Use theirs.
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "EEXIST" || code === "ENOTEMPTY" || code === "EPERM") {
-        return isCompleteTemplate(templateDir);
+        return isUsableTemplate(templateDir);
       }
       throw error;
     }
@@ -434,29 +534,48 @@ async function buildEmbeddedPostgresTemplate(templateDir: string): Promise<boole
 let templateDirPromise: Promise<string | null> | null = null;
 
 // Resolves the template data directory for this host, building it on first
-// use. Resolves null when the cache is disabled or the template could not be
-// published. Rejects only when a fresh cluster cannot start at all.
+// use. Resolves null when the cache is disabled, the cache root is not private
+// to this user, or the template could not be built or published; every caller
+// then takes the fresh path, which reports the real error itself (a cluster
+// that cannot start, a migration that cannot apply). Never rejects, so a
+// broken cache can never turn into `supported: false` and skip a suite.
 async function getEmbeddedPostgresTemplateDir(): Promise<string | null> {
   if (isTemplateCacheDisabled()) return null;
   if (!templateDirPromise) {
     templateDirPromise = (async () => {
-      const templateDir = path.join(templateRootDir(), computeEmbeddedPostgresTemplateKey());
-      if (isCompleteTemplate(templateDir)) return templateDir;
+      const rootDir = prepareTemplateRootDir();
+      if (rootDir === null) return null;
+      const templateDir = path.join(rootDir, computeEmbeddedPostgresTemplateKey());
+      if (isUsableTemplate(templateDir)) {
+        touchTemplate(templateDir);
+        return templateDir;
+      }
       try {
         const built = await buildEmbeddedPostgresTemplate(templateDir);
-        return built && isCompleteTemplate(templateDir) ? templateDir : null;
+        return built && isUsableTemplate(templateDir) ? templateDir : null;
       } catch (error) {
-        // Let the next caller try again instead of pinning the failure.
-        templateDirPromise = null;
-        throw error;
+        warnTemplateOnce(
+          "build",
+          `template build failed, using fresh clusters: ${(error as Error).message}`,
+        );
+        return null;
       }
     })();
   }
   return await templateDirPromise;
 }
 
+// Forgets the resolved template so the next caller in this process checks the
+// cache again. Used after a template start failed, for example because the
+// template was pruned by another process after this one resolved its path.
+function resetTemplateDirCache(): void {
+  templateDirPromise = null;
+}
+
 // Copies the template and starts a cluster on the copy. Each attempt uses a
-// fresh copy and a fresh port, mirroring `startEmbeddedPostgresWithRetry`.
+// fresh copy and a fresh port, mirroring `startEmbeddedPostgresWithRetry`. A
+// template that is no longer usable (pruned, or no longer private) is not
+// retried: the caller falls back and the next caller rebuilds it.
 async function startEmbeddedPostgresFromTemplateWithRetry(
   templateDir: string,
   tempDirPrefix: string,
@@ -464,6 +583,9 @@ async function startEmbeddedPostgresFromTemplateWithRetry(
   let lastError = new Error("embedded Postgres startup from template failed");
 
   for (let attempt = 1; attempt <= EMBEDDED_POSTGRES_START_MAX_ATTEMPTS; attempt += 1) {
+    if (!isUsableTemplate(templateDir)) {
+      throw new Error(`embedded Postgres template ${templateDir} is no longer usable`);
+    }
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
     const dataDir = path.join(rootDir, "data");
     let created: Awaited<ReturnType<typeof createEmbeddedPostgresTestInstanceAt>> | null = null;
@@ -499,24 +621,28 @@ let lastStartMode: EmbeddedPostgresStartMode | null = null;
 export const __startEmbeddedPostgresWithRetryForTests = startEmbeddedPostgresWithRetry;
 export const __embeddedPostgresStartMaxAttemptsForTests = EMBEDDED_POSTGRES_START_MAX_ATTEMPTS;
 export const __embeddedPostgresTemplateRootDirForTests = templateRootDir;
+export const __isUsableEmbeddedPostgresTemplateForTests = isUsableTemplate;
 export function __lastEmbeddedPostgresStartModeForTests(): EmbeddedPostgresStartMode | null {
   return lastStartMode;
+}
+// Forgets the support probe result, the resolved template, and the one-time
+// warnings so a test can drive the probe and the cache again in one process.
+export function __resetEmbeddedPostgresTemplateStateForTests(): void {
+  embeddedPostgresSupportPromise = null;
+  templateDirPromise = null;
+  templateFallbackWarned = false;
+  warnedTemplateTopics.clear();
+  lastStartMode = null;
 }
 
 async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSupport> {
   // A published template proves this host can run the cluster: it was built
   // here. Reusing it makes the probe free for every file after the first.
   // Building it costs one cluster start, the same as the throwaway probe did.
-  try {
-    if ((await getEmbeddedPostgresTemplateDir()) !== null) return { supported: true };
-  } catch (error) {
-    return {
-      supported: false,
-      reason: formatEmbeddedPostgresError(error, {
-        fallbackMessage: "embedded Postgres startup failed",
-      }).message,
-    };
-  }
+  // When the template cannot be built or used, the throwaway probe below
+  // decides, so only a cluster that cannot start reports `supported: false`;
+  // a migration that cannot apply fails the suite loudly on the fresh path.
+  if ((await getEmbeddedPostgresTemplateDir()) !== null) return { supported: true };
 
   let started: { dataDir: string; instance: EmbeddedPostgresInstance } | null = null;
 
@@ -551,19 +677,16 @@ export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgres
 async function startEmbeddedPostgresClusterForSuite(
   tempDirPrefix: string,
 ): Promise<{ port: number; dataDir: string; instance: EmbeddedPostgresInstance; mode: EmbeddedPostgresStartMode }> {
-  let templateDir: string | null = null;
-  try {
-    templateDir = await getEmbeddedPostgresTemplateDir();
-  } catch {
-    // A fresh cluster could not start while building the template. The fresh
-    // path below retries and throws the real reason if it fails again.
-  }
+  const templateDir = await getEmbeddedPostgresTemplateDir();
 
   if (templateDir !== null) {
     try {
       const started = await startEmbeddedPostgresFromTemplateWithRetry(templateDir, tempDirPrefix);
       return { ...started, mode: "template" };
     } catch (error) {
+      // The next caller in this process re-resolves the template: if it was
+      // pruned it is rebuilt, instead of retrying a path that is gone.
+      resetTemplateDirCache();
       if (!templateFallbackWarned) {
         templateFallbackWarned = true;
         console.warn(

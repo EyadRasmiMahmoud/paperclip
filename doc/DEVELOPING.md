@@ -536,17 +536,29 @@ For normal issue work, start with the smallest targeted check that proves the ch
 Suites that call `startEmbeddedPostgresTestDatabase` (from `@paperclipai/db`)
 get their own embedded Postgres cluster. The first such suite on a host builds
 one fully migrated cluster and publishes its data directory under
-`$TMPDIR/paperclip-embedded-postgres-templates/<key>`. Every later suite copies
-that template and starts Postgres on the copy instead of running `initdb` and
-all migrations again, and the `getEmbeddedPostgresTestSupport` probe reuses it
-instead of starting a throwaway cluster. The key hashes the embedded-postgres
-version, the initdb flags, and every migration file, so a changed migration
-builds a new template. Each suite still runs `applyPendingMigrations` on its
-copy, which is a no-op when the template is current.
+`$TMPDIR/paperclip-embedded-postgres-templates-<uid>/<key>`. Every later suite
+copies that template and starts Postgres on the copy instead of running
+`initdb` and all migrations again, and the `getEmbeddedPostgresTestSupport`
+probe reuses it instead of starting a throwaway cluster. The key hashes the
+embedded-postgres version, the initdb flags, and every migration file, so a
+changed migration builds a new template. Each suite still runs
+`applyPendingMigrations` on its copy, which is a no-op when the template is
+current. Templates for other keys are removed after seven days without use.
+
+A template is a Postgres data directory, and starting it executes its
+configuration, so the cache is private to the current OS user: the root is
+created with mode `0700` and is only used when it is a real directory (not a
+symlink) owned by the current user with no group or world write bit, and each
+template is checked the same way before it is copied. A root that fails those
+checks (for example one pre-created by another user in a shared `/tmp`) is left
+alone and every suite in that process uses a fresh cluster.
 
 Set `PAPERCLIP_TEST_POSTGRES_TEMPLATE=0` to bypass the cache and give every
 suite a fresh `initdb`, for example when debugging cluster startup itself. A
-failure on the template path falls back to the fresh path automatically.
+failure on the template path (root checks, build, copy, start, or publish)
+falls back to the fresh path automatically, so the cache can make a suite
+slower but never fail it or skip it: a migration that cannot apply still fails
+the suite on the fresh path.
 
 ### Task search evaluation
 

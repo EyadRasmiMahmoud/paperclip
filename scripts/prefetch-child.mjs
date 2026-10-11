@@ -15,6 +15,12 @@
 // holds a pipe from the parent and stops its group when the pipe closes, which
 // the kernel does when the parent exits for any reason. The parent installs
 // no signal handlers.
+//
+// Windows has no process groups and `kill` there ends a process outright, so a
+// signalled supervisor could pass nothing on and its command would run on
+// after cleanup returned. There a deliberate stop goes through the same pipe
+// as a written request, which the supervisor answers by ending its command,
+// and only the SIGKILL escalation targets the supervisor itself.
 import { spawn } from 'node:child_process';
 import { closeSync, openSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -25,10 +31,18 @@ const GROUPS = process.platform !== 'win32';
 const running = child => child.pid !== undefined && child.exitCode === null && child.signalCode === null;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// Signals the child's whole process group (POSIX) or the child alone.
+// Signals the child's whole process group (POSIX). Without groups the
+// supervisor is asked to stop its command through the pipe it watches, since
+// `kill` would end the supervisor at once and leave the command running; only
+// SIGKILL is sent to the supervisor itself, after it has had its chance.
 const signalTree = (child, signal) => {
   if (child.pid === undefined) return;
-  if (!GROUPS) { if (running(child)) child.kill(signal); return; }
+  if (!GROUPS) {
+    if (!running(child)) return;
+    if (signal === 'SIGKILL') child.kill(signal);
+    else if (child.stdin?.writable) child.stdin.end('stop\n');
+    return;
+  }
   try { process.kill(-child.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
 };
 // True while any member of the child's group exists. On a platform without

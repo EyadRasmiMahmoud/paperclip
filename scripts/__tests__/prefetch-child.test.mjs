@@ -68,7 +68,7 @@ test('stopping a running prefetch waits for it to exit so its directory can be r
   await assert.rejects(handle.done, /slow prefetch failed \(SIGTERM\): started/);
 }));
 
-test('a prefetch that ignores SIGTERM is killed after the grace period', async () => withScratch(async root => {
+test('a prefetch that ignores SIGTERM is killed after the grace period', { skip: process.platform === 'win32' && 'SIGTERM cannot be ignored on Windows' }, async () => withScratch(async root => {
   const handle = start(root, 'stubborn', "process.on('SIGTERM', () => {}); process.stdout.write('ignoring\\n'); setInterval(() => {}, 1000)");
   await untilLogHas(join(root, 'stubborn.log'), 'ignoring');
   const stopping = Date.now();
@@ -106,6 +106,22 @@ test('stopping a prefetch also stops the processes it started', { skip: process.
   await stopPrefetches([handle]);
   assert.ok(await untilGone(pid), `grandchild ${pid} outlived stopPrefetches`);
   assert.notEqual(handle.child.signalCode ?? handle.child.exitCode, null);
+}));
+
+test('a stop request written to the pipe ends the command and the processes it started, with no signal to the supervisor', { skip: process.platform === 'win32' && 'the grandchild check reads /proc' }, async () => withScratch(async root => {
+  // This is the stop path on a platform without process groups: there `kill`
+  // would end the supervisor outright and leave its command running, so
+  // `stopPrefetches` writes a request instead. The supervisor answers it
+  // the way it answers the parent's exit, and its own exit still reports the
+  // command's fate.
+  const handle = start(root, 'tree', GRANDCHILD_SCRIPT);
+  const pid = await grandchildPid(join(root, 'tree.log'));
+  handle.child.stdin.end('stop\n');
+  await assert.rejects(handle.done, /tree prefetch failed \(SIGTERM\)/);
+  assert.ok(await untilGone(pid), `grandchild ${pid} outlived the stop request`);
+  assert.match(readFileSync(join(root, 'tree.log'), 'utf8'), /stop requested; stopping/);
+  assert.doesNotMatch(readFileSync(join(root, 'tree.log'), 'utf8'), /parent exited/);
+  await stopPrefetches([handle]);
 }));
 
 // A separate parent process stands in for the verifier: it starts a prefetch

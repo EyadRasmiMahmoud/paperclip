@@ -2,15 +2,18 @@
 // its own process group and stops the whole group when the parent that started
 // it is gone.
 //
-// The parent holds the write end of this process's stdin and never writes to
-// it. The kernel closes that end when the parent exits for any reason: a
-// Ctrl-C delivered while the parent is blocked in synchronous work, a plain
-// `kill`, or SIGKILL. Reading EOF here is therefore the only parent-death
-// signal needed, and the parent runs no signal handler of its own, so its
-// default termination stays immediate. Group-wide signals the parent sends
-// through `stopPrefetches` reach this process too; it passes them on to the
-// command and stays alive until the command exits, so its own exit reports
-// the command's outcome (exit code, or the same signal).
+// The parent holds the write end of this process's stdin. The kernel closes
+// that end when the parent exits for any reason: a Ctrl-C delivered while the
+// parent is blocked in synchronous work, a plain `kill`, or SIGKILL. Reading
+// EOF here is therefore the only parent-death signal needed, and the parent
+// runs no signal handler of its own, so its default termination stays
+// immediate. The parent writes to the pipe for one reason only: to ask for a
+// deliberate stop where it cannot signal the group, which is Windows, where
+// `kill` ends a process outright and a signalled supervisor could not pass
+// anything on. Group-wide signals the parent sends through `stopPrefetches`
+// on POSIX reach this process too; it passes them on to the command and stays
+// alive until the command exits, so its own exit reports the command's
+// outcome (exit code, or the same signal).
 import { spawn } from 'node:child_process';
 import { fstatSync } from 'node:fs';
 import { constants } from 'node:os';
@@ -37,20 +40,22 @@ const signalGroup = signal => {
 // this process alone. The parent owns the SIGKILL escalation in that case.
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => signalChild(signal));
 
-let orphaned = false;
-const parentGone = () => {
-  if (orphaned) return;
-  orphaned = true;
-  process.stderr.write(`prefetch supervisor: parent exited; stopping ${cmd}\n`);
+let stopping = false;
+const stopGroup = reason => {
+  if (stopping) return;
+  stopping = true;
+  process.stderr.write(`prefetch supervisor: ${reason}; stopping ${cmd}\n`);
   signalGroup('SIGTERM');
   setTimeout(() => signalGroup('SIGKILL'), GRACE_MS).unref();
 };
-// Only a pipe can report the parent's exit (Node creates its stdio pipes as
-// socket pairs). Run by hand with a terminal or /dev/null on stdin, there is
-// no parent to watch and nothing is read.
+// Only a pipe can carry a stop request or report the parent's exit (Node
+// creates its stdio pipes as socket pairs). Run by hand with a terminal or
+// /dev/null on stdin, there is no parent to watch and nothing is read.
 let stdinIsPipe = false;
 try { const stdin = fstatSync(0); stdinIsPipe = stdin.isFIFO() || stdin.isSocket(); } catch {}
 if (stdinIsPipe) {
+  process.stdin.on('data', () => stopGroup('stop requested'));
+  const parentGone = () => stopGroup('parent exited');
   process.stdin.on('end', parentGone);
   process.stdin.on('close', parentGone);
   process.stdin.on('error', parentGone);

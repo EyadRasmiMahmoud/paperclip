@@ -25,6 +25,8 @@ const untilLogHas = async (path, text) => {
 
 test('a successful prefetch resolves, keeps its output, and is left alone by stop', async () => withScratch(async root => {
   const handle = start(root, 'ok', "setTimeout(() => process.stdout.write('fetched\\n'), 150)");
+  // The parent keeps its default, immediate termination: no handler of ours.
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) assert.equal(process.listenerCount(signal), 0, `${signal} handler installed in the parent`);
   await handle.done;
   assert.equal(handle.child.exitCode, 0);
   assert.equal(readFileSync(join(root, 'ok.log'), 'utf8'), 'fetched\n');
@@ -106,21 +108,48 @@ test('stopping a prefetch also stops the processes it started', { skip: process.
   assert.notEqual(handle.child.signalCode ?? handle.child.exitCode, null);
 }));
 
-test('a terminal signal to the parent reaches the processes a prefetch started', { skip: process.platform === 'win32' && 'process groups are POSIX only' }, async () => withScratch(async root => {
-  // A separate parent process stands in for the verifier: it starts a prefetch
-  // whose child starts a grandchild, then receives SIGINT the way a terminal
-  // would send it. Both must stop, and the parent must still die of SIGINT.
-  const script = `
-    import { startPrefetch } from ${JSON.stringify(new URL('../prefetch-child.mjs', import.meta.url).href)};
-    startPrefetch({ name: 'tree', cmd: process.execPath, args: ['-e', ${JSON.stringify(GRANDCHILD_SCRIPT)}], cwd: ${JSON.stringify(root)}, env: process.env, logPath: ${JSON.stringify(join(root, 'tree.log'))} });
-    setInterval(() => {}, 1000);
-  `;
-  const parent = spawn(process.execPath, ['--input-type=module', '-e', script], { cwd: root, stdio: 'ignore' });
-  const exited = new Promise(resolve => parent.once('exit', (code, signal) => resolve({ code, signal })));
-  const pid = await grandchildPid(join(root, 'tree.log'));
-  parent.kill('SIGINT');
-  assert.deepEqual(await exited, { code: null, signal: 'SIGINT' });
-  assert.ok(await untilGone(pid), `grandchild ${pid} outlived the parent's SIGINT`);
+// A separate parent process stands in for the verifier: it starts a prefetch
+// whose child starts a grandchild, then does `work` (a module-scope statement).
+const parentScript = (root, work) => `
+  import { execFileSync } from 'node:child_process';
+  import { startPrefetch } from ${JSON.stringify(new URL('../prefetch-child.mjs', import.meta.url).href)};
+  startPrefetch({ name: 'tree', cmd: process.execPath, args: ['-e', ${JSON.stringify(GRANDCHILD_SCRIPT)}], cwd: ${JSON.stringify(root)}, env: process.env, logPath: ${JSON.stringify(join(root, 'tree.log'))} });
+  ${work}
+`;
+
+for (const signal of ['SIGINT', 'SIGKILL']) {
+  test(`${signal} to the parent ends the processes a prefetch started, and the parent dies of it at once`, { skip: process.platform === 'win32' && 'process groups are POSIX only' }, async () => withScratch(async root => {
+    // The parent runs no handler, so it dies of the signal immediately, and the
+    // prefetch tree stops because the parent is gone, not because it was told:
+    // SIGKILL leaves the parent no chance to tell anyone anything.
+    const parent = spawn(process.execPath, ['--input-type=module', '-e', parentScript(root, 'setInterval(() => {}, 1000);')], { cwd: root, stdio: 'ignore' });
+    const exited = new Promise(resolve => parent.once('exit', (code, signal) => resolve({ code, signal })));
+    const pid = await grandchildPid(join(root, 'tree.log'));
+    parent.kill(signal);
+    assert.deepEqual(await exited, { code: null, signal });
+    assert.ok(await untilGone(pid), `grandchild ${pid} outlived the parent's ${signal}`);
+    assert.match(readFileSync(join(root, 'tree.log'), 'utf8'), /parent exited; stopping/);
+  }));
+}
+
+test('Ctrl-C while the parent is blocked in synchronous work stops it at once, and the prefetch tree with it', { skip: process.platform === 'win32' && 'process groups are POSIX only' }, async () => withScratch(async root => {
+  // The verifier runs `execFileSync` for the standalone builds while prefetches
+  // run, and a JavaScript signal handler cannot run until that returns. The
+  // parent gets its own group here so the signal can be sent the way a
+  // terminal sends Ctrl-C: to the foreground group, which is the parent and
+  // its synchronous command, and not the detached prefetch tree.
+  const parent = spawn(process.execPath, ['--input-type=module', '-e', parentScript(root, "execFileSync(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: 'ignore' });")], { cwd: root, stdio: 'ignore', detached: true });
+  try {
+    const exited = new Promise(resolve => parent.once('exit', (code, signal) => resolve({ code, signal })));
+    const pid = await grandchildPid(join(root, 'tree.log'));
+    const signalled = Date.now();
+    process.kill(-parent.pid, 'SIGINT');
+    assert.deepEqual(await exited, { code: null, signal: 'SIGINT' });
+    assert.ok(Date.now() - signalled < 2000, `the parent took ${Date.now() - signalled}ms to die: it waited for the synchronous command`);
+    assert.ok(await untilGone(pid), `grandchild ${pid} outlived the parent's Ctrl-C`);
+  } finally {
+    try { process.kill(-parent.pid, 'SIGKILL'); } catch {}
+  }
 }));
 
 test('an unawaited failure never becomes an unhandled rejection', () => {

@@ -6,14 +6,22 @@
 // A child may start processes of its own: the bundled-dependency installs are
 // a Node wrapper blocked in `npm install`. Signalling only the wrapper would
 // leave npm writing into the scratch root while it is removed, so on POSIX
-// each child leads its own process group, and stopping signals and waits for
-// the whole group. The parent's own terminal signals are forwarded to the
-// groups while any child runs, so Ctrl-C still stops everything.
+// each command runs under `prefetch-supervisor.mjs` as the leader of its own
+// process group, and stopping signals and waits for the whole group. A group
+// of its own no longer receives the terminal's Ctrl-C, and the parent cannot
+// forward it: the verifier spends most of its time blocked in `execFileSync`,
+// where no JavaScript signal handler can run, and installing one would also
+// replace the parent's immediate default termination. Instead the supervisor
+// holds a pipe from the parent and stops its group when the pipe closes, which
+// the kernel does when the parent exits for any reason. The parent installs
+// no signal handlers.
 import { spawn } from 'node:child_process';
 import { closeSync, openSync, readFileSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+export const PREFETCH_SUPERVISOR_SCRIPT = fileURLToPath(new URL('./prefetch-supervisor.mjs', import.meta.url));
 
 const GROUPS = process.platform !== 'win32';
-const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 const running = child => child.pid !== undefined && child.exitCode === null && child.signalCode === null;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -31,45 +39,27 @@ const treeAlive = child => {
   try { process.kill(-child.pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
 };
 
-// Terminal signals reach the parent's group only. While a prefetch runs, the
-// same signal is passed on to its group and the parent then exits the way it
-// would have without the handler.
-const live = new Set();
-const forward = signal => {
-  for (const child of live) signalTree(child, signal);
-  for (const name of FORWARDED_SIGNALS) process.removeListener(name, forward);
-  process.kill(process.pid, signal);
-};
-const track = child => {
-  if (!GROUPS) return;
-  if (live.size === 0) for (const name of FORWARDED_SIGNALS) process.on(name, forward);
-  live.add(child);
-};
-const untrack = child => {
-  live.delete(child);
-  if (live.size === 0) for (const name of FORWARDED_SIGNALS) process.removeListener(name, forward);
-};
-
-// Returns { name, child, done, durationMs }. `done` resolves on exit code 0
-// and otherwise rejects with the tail of the log; the rejection is observed
-// here so an unawaited failure never surfaces as an unhandled rejection.
+// Returns { name, child, done, durationMs }. `child` is the supervisor, whose
+// exit code or signal is the command's. `done` resolves on exit code 0 and
+// otherwise rejects with the tail of the log; the rejection is observed here
+// so an unawaited failure never surfaces as an unhandled rejection.
 export function startPrefetch({ name, cmd, args, cwd, env, logPath }) {
   const startedAt = Date.now();
   const log = openSync(logPath, 'w');
   let child;
   try {
-    child = spawn(cmd, args, { cwd, env, stdio: ['ignore', log, log], detached: GROUPS });
+    // stdin is the pipe the supervisor watches; nothing is ever written to it.
+    child = spawn(process.execPath, [PREFETCH_SUPERVISOR_SCRIPT, cmd, ...args], { cwd, env, stdio: ['pipe', log, log], detached: GROUPS });
   } finally {
     closeSync(log); // the child holds its own descriptor
   }
-  if (child.pid !== undefined) track(child);
+  child.stdin?.on('error', () => {});
   const handle = { name, child, done: null, durationMs: null };
   let settled = false;
   handle.done = new Promise((settle, reject) => {
     const finish = failure => {
       if (settled) return;
       settled = true;
-      untrack(child);
       // The caller may be blocked in synchronous work when the child exits, so
       // this event can arrive long after the fact. When the child wrote
       // anything, its last write is the end time; both downloads this serves

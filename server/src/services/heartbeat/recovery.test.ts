@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environments, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -329,9 +329,14 @@ describePostgres("heartbeat recovery module ownership", () => {
     const f = await seedShutdownSource();
     await db.update(environmentLeases).set({ leasePolicy }).where(eq(environmentLeases.id, f.lease.id));
     const control = createAdapterExecutionControl(); control.controller.abort(); adapterExecutionControls.set(f.run.id, control);
+    const [environmentRow] = await db.insert(environments).values({ name: "Guarded source", driver: "sandbox" }).returning();
+    const environment = (await environmentService(db).getById(environmentRow.id))!;
+    const leaseSnapshot = (await environmentService(db).getLeaseById(f.lease.id))!;
+    leaseSnapshot.metadata = f.lease.metadata;
+    const resume = vi.fn(async () => null); const destroy = vi.fn(async () => null);
     const stop = vi.fn(async () => ({ providerLeaseId: f.lease.providerLeaseId, state: "stopped" }));
     const runtime = environmentRuntimeService(db, { drivers: [{ driver: "sandbox", resolveCapabilities: async () => classifyEnvironmentCapabilities({}),
-      acquireRunLease: async () => { throw new Error("Unexpected acquire"); }, releaseRunLease: vi.fn(), retryPendingSandboxTeardown: stop }] });
+      acquireRunLease: async () => { throw new Error("Unexpected acquire"); }, releaseRunLease: vi.fn(), retryPendingSandboxTeardown: stop, resumeRunLease: resume, destroyRunLease: destroy }] });
     try {
       await runtime.releaseRunLeases(f.run.id, "released", undefined, "stop_and_retain", true);
       adapterExecutionControls.delete(f.run.id); // SIGKILL before export/finally settled.
@@ -347,8 +352,12 @@ describePostgres("heartbeat recovery module ownership", () => {
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0].resultJson)
         .toMatchObject({ workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovery: { leaseIds: [f.lease.id] } });
       expect(await legacyShutdownWorkspaceResourceProtected(db, source)).toBe(true);
+      // Direct operations and pre-fence snapshots cannot bypass the source pin.
+      expect(await runtime.resumeRunLease({ environment, lease: leaseSnapshot })).toBeNull();
+      expect(await runtime.destroyRunLease({ environment, lease: leaseSnapshot })).toBeNull();
+      expect(resume).not.toHaveBeenCalled(); expect(destroy).not.toHaveBeenCalled();
       expect(stop).toHaveBeenCalledOnce();
-    } finally { control.finish(); await deleteShutdownSource(f); }
+    } finally { control.finish(); await deleteShutdownSource(f); await db.delete(environments).where(eq(environments.id, environment.id)); }
   });
 
   it("retries lease release when ordinary completion wins the shutdown status race", async () => {

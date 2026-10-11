@@ -4432,6 +4432,7 @@ export function environmentRuntimeService(
     },
 
     async resumeRunLease(input: EnvironmentDriverLeaseInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {
+      if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.resumeRunLease) {
         throw new Error(`Environment driver "${driver.driver}" does not support lease resume.`);
@@ -4440,6 +4441,7 @@ export function environmentRuntimeService(
     },
 
     async destroyRunLease(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null> {
+      if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
       if (input.lease.metadata?.legacyShutdownWorkspaceSettlement) {
         if (!(await allowLegacyShutdownWorkspaceCleanup(db, input.lease))) return null;
         const current = await environmentsSvc.getLeaseById(input.lease.id);

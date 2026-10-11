@@ -120,19 +120,28 @@ test('the bundled-dependency installs run together while the other packages are 
   // Only the bundled packages' sources are staged before the installs start;
   // the installs are registered for cleanup at once, before anything else can
   // fail; the other packages are copied while the installs run; the join comes
-  // before the first pack; and the pack loop walks every package in order.
+  // before the packs start; and the packs run through the helper covered by
+  // pack-staged-packages.test.mjs, bundled packages first, each registered for
+  // cleanup as it starts, with the results put back into dependency order
+  // before every tarball is checked.
   const bundledSources = position('for (const entry of entries.filter(entry => entry.bundled)) stageSource(entry)');
   const start = position("startBundledInstalls(entries.filter(entry => entry.bundled), { logDir: prefetched, cwd: repo })");
   const registered = position('prefetches.push(...installs.map(({ handle }) => handle))');
   const otherSources = position('for (const entry of entries.filter(entry => !entry.bundled))');
   const join = position("await awaited('bundled', Promise.all(installs.map(({ handle }) => handle.done)))");
-  const packLoop = position('for (const { target } of entries)');
-  const firstPack = position("run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target)");
-  assert.ok(bundledSources < start && start < registered && registered < otherSources && otherSources < join && join < packLoop && packLoop < firstPack);
-  assert.equal(source.match(/run\('npm', \['pack'/g).length, 2, 'one package pack loop plus the lifecycle sentinel');
-  // The timing line reports the split staging phase and each install.
-  for (const key of ['stage_sources_ms', 'stage_bundled_ms', 'stage_pack_ms']) assert.ok(source.includes(`timing.${key} =`));
+  assert.ok(source.includes("import { packConcurrency, packStagedPackages, packTimings } from './pack-staged-packages.mjs'"));
+  const packs = position("await packStagedPackages([...entries].sort((a, b) => Number(b.bundled) - Number(a.bundled)), { logDir: prefetched, env, concurrency, register: handle => prefetches.push(handle) })");
+  const reordered = position('packs.sort((a, b) => a.index - b.index)');
+  const checks = position("for (const tarball of tarballs) assertNoBundledCodexPayloads(run('tar', ['-tzf', tarball])");
+  const copied = position('for (const tarball of tarballs) {');
+  assert.ok(bundledSources < start && start < registered && registered < otherSources && otherSources < join && join < packs && packs < reordered && reordered < checks && checks < copied);
+  assert.equal(source.match(/run\('npm', \['pack'/g).length, 1, 'only the lifecycle sentinel is packed in-process');
+  assert.ok(source.includes("destination: join(root, `pack-${index}`)"), 'each pack writes into its own directory');
+  // The timing line reports the split staging phase, each install, and the
+  // pack step with what the packs would have cost one after another.
+  for (const key of ['stage_sources_ms', 'stage_bundled_ms', 'stage_pack_ms', 'stage_pack_check_ms']) assert.ok(source.includes(`timing.${key} =`));
   assert.ok(source.includes('...bundledInstallTimings(installs)'));
+  assert.ok(source.includes('Object.assign(timing, packTimings(packs, concurrency))'));
 });
 
 test('the installed Codex probe exercises the public export and rejects incomplete or mismatched packages', () => {

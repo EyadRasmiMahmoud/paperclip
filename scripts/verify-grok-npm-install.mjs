@@ -8,6 +8,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { packConcurrency, packStagedPackages, packTimings } from './pack-staged-packages.mjs';
 import { materializePublishManifest } from './prepare-bundled-package.mjs';
 import { GROK_PUBLIC_INSTALL_IMAGE, GROK_PUBLIC_INSTALL_LIFECYCLE, assertNoBundledCodexPayloads, grokConsumerDockerArgs, installedCodexProbeSource } from './grok-public-install-sandbox.mjs';
 import { startPrefetch, stopPrefetches } from './prefetch-child.mjs';
@@ -73,12 +74,14 @@ try {
   // each need a host-side `npm install` of their bundled closure; those installs
   // write only their own `package-<index>` and read nothing another package
   // produces, so they start first and run together while the other packages
-  // are copied, instead of one after another inside one loop. Packing stays
-  // serial and in order, because each tarball is checked as it is produced.
+  // are copied, instead of one after another inside one loop. Packing is a
+  // Node start-up plus CPU-bound gzip per package that reads only the package's
+  // own directory, so the packs also run together, each into its own
+  // `pack-<index>`, and the tarballs are checked in order once all are made.
   const entries = [...needed].map((name, index) => {
     const { dir, manifest } = packages.get(name);
     const bundled = (manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length > 0;
-    return { name, dir, manifest, bundled, target: join(root, `package-${index}`), stagedSource: join(root, `source-${index}`) };
+    return { name, index, dir, manifest, bundled, target: join(root, `package-${index}`), stagedSource: join(root, `source-${index}`), destination: join(root, `pack-${index}`) };
   });
   const stageSource = ({ dir, manifest, stagedSource }) => {
     mkdirSync(stagedSource);
@@ -109,16 +112,20 @@ try {
   await awaited('bundled', Promise.all(installs.map(({ handle }) => handle.done)));
   timing.stage_bundled_ms = Math.round(performance.now() - installsStarted);
   const packStarted = performance.now();
-  const tarballs = [];
-  for (const { target } of entries) {
-    run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target);
-    const packed = readdirSync(root).filter(f => f.endsWith('.tgz') && !tarballs.includes(join(root, f)));
-    assert.equal(packed.length, 1);
-    const tarball = join(root, packed[0]);
-    assertNoBundledCodexPayloads(run('tar', ['-tzf', tarball]).toString().trim().split('\n'));
-    tarballs.push(tarball);
-  }
+  // The bundled packages make the largest tarballs, so they are launched first
+  // and the short packs fill the remaining slots behind them. Each pack is
+  // registered for cleanup as it starts, so a failure stops the ones still
+  // running before the scratch root is removed. The results are put back into
+  // dependency order before the tarballs are checked and copied.
+  const concurrency = packConcurrency();
+  const packs = await packStagedPackages([...entries].sort((a, b) => Number(b.bundled) - Number(a.bundled)), { logDir: prefetched, env, concurrency, register: handle => prefetches.push(handle) });
+  packs.sort((a, b) => a.index - b.index);
+  const checksStarted = performance.now();
+  const tarballs = packs.map(({ tarball }) => tarball);
+  for (const tarball of tarballs) assertNoBundledCodexPayloads(run('tar', ['-tzf', tarball]).toString().trim().split('\n'));
+  timing.stage_pack_check_ms = Math.round(performance.now() - checksStarted);
   timing.stage_pack_ms = Math.round(performance.now() - packStarted);
+  Object.assign(timing, packTimings(packs, concurrency));
   const assets = join(root, 'assets'); mkdirSync(assets, { mode: 0o755 });
   const consumer = join(root, 'consumer'); mkdirSync(consumer);
   const cache = join(root, 'cache'); mkdirSync(cache);

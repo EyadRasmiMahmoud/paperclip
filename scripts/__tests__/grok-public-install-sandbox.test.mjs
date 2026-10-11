@@ -110,6 +110,31 @@ test('the image and Grok downloads start before staging and join without weakeni
   assert.equal(source.match(/rmSync\(root/g).length, 1);
 });
 
+test('the bundled-dependency installs run together while the other packages are copied, and pack in order', () => {
+  const source = readFileSync(new URL('../verify-grok-npm-install.mjs', import.meta.url), 'utf8');
+  const position = fragment => { const index = source.indexOf(fragment); assert.notEqual(index, -1, `verifier must contain ${fragment}`); return index; };
+  // The installs are children of the script's own CLI entry through the helper
+  // covered by stage-bundled-packages.test.mjs, never in-process calls.
+  assert.doesNotMatch(source, /prepareBundledPackage/);
+  assert.ok(source.includes("import { bundledInstallTimings, startBundledInstalls } from './stage-bundled-packages.mjs'"));
+  // Only the bundled packages' sources are staged before the installs start;
+  // the installs are registered for cleanup at once, before anything else can
+  // fail; the other packages are copied while the installs run; the join comes
+  // before the first pack; and the pack loop walks every package in order.
+  const bundledSources = position('for (const entry of entries.filter(entry => entry.bundled)) stageSource(entry)');
+  const start = position("startBundledInstalls(entries.filter(entry => entry.bundled), { logDir: prefetched, cwd: repo })");
+  const registered = position('prefetches.push(...installs.map(({ handle }) => handle))');
+  const otherSources = position('for (const entry of entries.filter(entry => !entry.bundled))');
+  const join = position("await awaited('bundled', Promise.all(installs.map(({ handle }) => handle.done)))");
+  const packLoop = position('for (const { target } of entries)');
+  const firstPack = position("run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target)");
+  assert.ok(bundledSources < start && start < registered && registered < otherSources && otherSources < join && join < packLoop && packLoop < firstPack);
+  assert.equal(source.match(/run\('npm', \['pack'/g).length, 2, 'one package pack loop plus the lifecycle sentinel');
+  // The timing line reports the split staging phase and each install.
+  for (const key of ['stage_sources_ms', 'stage_bundled_ms', 'stage_pack_ms']) assert.ok(source.includes(`timing.${key} =`));
+  assert.ok(source.includes('...bundledInstallTimings(installs)'));
+});
+
 test('the installed Codex probe exercises the public export and rejects incomplete or mismatched packages', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'installed-codex-probe-')));
   try {

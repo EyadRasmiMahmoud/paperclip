@@ -65,6 +65,31 @@ test('the installs run at the same time, each with its own source and target', a
   for (const value of Object.values(timings)) assert.ok(Number.isInteger(value) && value >= 0);
 }));
 
+test('stopping the installs after one fails also stops the npm process the other started', { skip: process.platform === 'win32' && 'process groups are POSIX only' }, async () => withScratch(async root => {
+  // The real wrapper blocks in `execFileSync('npm', ['install', ...])`; here
+  // the stand-in npm announces its pid and runs on, and the wrapper blocks on
+  // it the same way. Stopping only the wrapper would leave it writing.
+  const script = fakeScript(root, `
+    import { execFileSync } from 'node:child_process';
+    const [, target] = process.argv.slice(2);
+    if (target.endsWith('package-1')) { console.error('bundled install exploded'); process.exit(2); }
+    execFileSync(process.execPath, ['-e', "process.stdout.write('npm ' + process.pid + '\\\\n'); setInterval(() => {}, 1000)"], { stdio: 'inherit' });
+  `);
+  const installs = startBundledInstalls(entriesFor(root, ['@paperclipai/server', '@paperclipai/db']), { logDir: root, cwd: root, script });
+  await assert.rejects(Promise.all(installs.map(({ handle }) => handle.done)), /bundled-db prefetch failed \(exit 2\)/);
+  const log = join(root, 'bundled-server.log');
+  const logHasPid = () => existsSync(log) && /npm \d+/.test(readFileSync(log, 'utf8'));
+  for (let attempt = 0; attempt < 200 && !logHasPid(); attempt++) await new Promise(resolve => setTimeout(resolve, 25));
+  const npmPid = Number(readFileSync(log, 'utf8').match(/npm (\d+)/)[1]);
+  const alive = pid => { try { process.kill(pid, 0); return !/^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch (error) { return error.code !== 'ESRCH'; } };
+  assert.ok(alive(npmPid), 'the stand-in npm runs before the stop');
+  await stopPrefetches(installs.map(({ handle }) => handle));
+  let stopped = false;
+  for (let attempt = 0; attempt < 200 && !(stopped = !alive(npmPid)); attempt++) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.ok(stopped, `stand-in npm ${npmPid} outlived stopPrefetches`);
+  assert.notEqual(installs[0].handle.child.signalCode ?? installs[0].handle.child.exitCode, null);
+}));
+
 test('a failed install rejects with the tail of its own log and leaves the others to be stopped', async () => withScratch(async root => {
   const script = fakeScript(root, `
     const [, target] = process.argv.slice(2);

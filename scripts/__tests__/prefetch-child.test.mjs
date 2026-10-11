@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -73,6 +73,54 @@ test('a prefetch that ignores SIGTERM is killed after the grace period', async (
   await stopPrefetches([handle], { graceMs: 200 });
   assert.ok(Date.now() - stopping >= 200 && Date.now() - stopping < 4000);
   assert.equal(handle.child.signalCode, 'SIGKILL');
+}));
+
+// A process is gone once the kernel no longer knows it, or once it is a zombie
+// that only waits to be reaped: either way it can no longer write anywhere.
+const gone = pid => {
+  try { process.kill(pid, 0); } catch (error) { return error.code === 'ESRCH'; }
+  try { return /^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; }
+};
+const untilGone = async pid => {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (gone(pid)) return true;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  return false;
+};
+// The child starts a process of its own that announces its pid and then runs
+// on, the way the bundled-dependency installs block in `npm install`.
+const GRANDCHILD_SCRIPT = `
+  const { spawn } = require('node:child_process');
+  const grandchild = spawn(process.execPath, ['-e', "process.stdout.write('grandchild ' + process.pid + '\\\\n'); setInterval(() => {}, 1000)"], { stdio: 'inherit' });
+  grandchild.on('exit', () => process.exit(0));
+`;
+const grandchildPid = async log => { await untilLogHas(log, 'grandchild '); return Number(readFileSync(log, 'utf8').match(/grandchild (\d+)/)[1]); };
+
+test('stopping a prefetch also stops the processes it started', { skip: process.platform === 'win32' && 'process groups are POSIX only' }, async () => withScratch(async root => {
+  const handle = start(root, 'tree', GRANDCHILD_SCRIPT);
+  const pid = await grandchildPid(join(root, 'tree.log'));
+  assert.ok(!gone(pid), 'the grandchild runs before the stop');
+  await stopPrefetches([handle]);
+  assert.ok(await untilGone(pid), `grandchild ${pid} outlived stopPrefetches`);
+  assert.notEqual(handle.child.signalCode ?? handle.child.exitCode, null);
+}));
+
+test('a terminal signal to the parent reaches the processes a prefetch started', { skip: process.platform === 'win32' && 'process groups are POSIX only' }, async () => withScratch(async root => {
+  // A separate parent process stands in for the verifier: it starts a prefetch
+  // whose child starts a grandchild, then receives SIGINT the way a terminal
+  // would send it. Both must stop, and the parent must still die of SIGINT.
+  const script = `
+    import { startPrefetch } from ${JSON.stringify(new URL('../prefetch-child.mjs', import.meta.url).href)};
+    startPrefetch({ name: 'tree', cmd: process.execPath, args: ['-e', ${JSON.stringify(GRANDCHILD_SCRIPT)}], cwd: ${JSON.stringify(root)}, env: process.env, logPath: ${JSON.stringify(join(root, 'tree.log'))} });
+    setInterval(() => {}, 1000);
+  `;
+  const parent = spawn(process.execPath, ['--input-type=module', '-e', script], { cwd: root, stdio: 'ignore' });
+  const exited = new Promise(resolve => parent.once('exit', (code, signal) => resolve({ code, signal })));
+  const pid = await grandchildPid(join(root, 'tree.log'));
+  parent.kill('SIGINT');
+  assert.deepEqual(await exited, { code: null, signal: 'SIGINT' });
+  assert.ok(await untilGone(pid), `grandchild ${pid} outlived the parent's SIGINT`);
 }));
 
 test('an unawaited failure never becomes an unhandled rejection', () => {

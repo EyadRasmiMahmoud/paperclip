@@ -235,18 +235,23 @@ const support = await getEmbeddedPostgresTestSupport();
 const describeWithPostgres = support.supported ? describe : describe.skip;
 
 // Points `os.tmpdir()` at a private scratch directory so a test can drive the
-// cache root from an empty state. POSIX `os.tmpdir()` reads TMPDIR on every
-// call. Returns the scratch directory; `restore` puts the environment and the
+// cache root from an empty state. `os.tmpdir()` reads the environment on every
+// call: TMPDIR on POSIX, TEMP and then TMP on Windows, so all three are set.
+// Returns the scratch directory; `restore` puts the environment and the
 // fixture's cached state back.
+const TMPDIR_VARIABLES = ["TMPDIR", "TEMP", "TMP"] as const;
+
 function useScratchTmpdir(prefix: string): { scratch: string; restore(): void } {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  const previous = process.env.TMPDIR;
-  process.env.TMPDIR = scratch;
+  const previous = new Map(TMPDIR_VARIABLES.map((name) => [name, process.env[name]] as const));
+  for (const name of TMPDIR_VARIABLES) process.env[name] = scratch;
   return {
     scratch,
     restore() {
-      if (previous === undefined) delete process.env.TMPDIR;
-      else process.env.TMPDIR = previous;
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
       resetTemplateState();
       fs.rmSync(scratch, { recursive: true, force: true });
     },
@@ -314,7 +319,15 @@ describeWithPostgres("startEmbeddedPostgresTestDatabase template path", () => {
 
   it("refreshes the template's timestamp on every reuse so idle time drives pruning", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async () => {
     delete process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
+    // Make sure a template exists before ageing it: the support probe does
+    // not publish one under PAPERCLIP_TEST_POSTGRES_TEMPLATE=0, and a name
+    // filter can run this test on its own.
+    resetTemplateState();
+    const first = await startEmbeddedPostgresTestDatabase("paperclip-template-touch-");
+    await first.cleanup();
+    expect(lastStartMode()).toBe("template");
     const templateDir = path.join(templateRootDir(), computeEmbeddedPostgresTemplateKey());
+    expect(isUsableTemplate(templateDir)).toBe(true);
     // Age the template as if it had not been used for ten days.
     const old = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
     fs.utimesSync(templateDir, old, old);
@@ -449,6 +462,9 @@ describe("support probe when the template cannot be built", () => {
       warnings.push(args.map(String).join(" "));
     };
     try {
+      // This test runs on every platform, so check the redirect took effect
+      // before asserting on paths under it.
+      expect(os.tmpdir()).toBe(scratch.scratch);
       // The fake cluster "starts" without listening, so the template build
       // fails after the start, at the migration step, the way a broken
       // migration would. A real broken migration then fails the suite on

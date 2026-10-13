@@ -1,3 +1,4 @@
+import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import { and, asc, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
@@ -354,8 +355,8 @@ export function activityService(db: Db) {
   }
 
   return {
-    list: (filters: ActivityFilters) => {
-      const conditions = [eq(activityLog.companyId, filters.companyId)];
+    list: async (filters: ActivityFilters) => {
+      const conditions = [eq(activityLog.companyId, filters.companyId), await skillAccessService(db).activityCondition(filters.companyId)];
       const limit = normalizeActivityLimit(filters.limit);
 
       if (filters.agentId) {

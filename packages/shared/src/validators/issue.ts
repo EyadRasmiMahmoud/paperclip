@@ -1,3 +1,4 @@
+import { taskWorkspaceSelectionSchema } from "./task-workspace.js";
 import { z } from "zod";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
@@ -556,6 +557,14 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+export const resumeWorkspaceFinalizationSchema = z.object({
+  actionId: z.string().guid(),
+  runId: z.string().guid(),
+  ownerToken: z.string().guid(),
+  controllerAndCopybackStopped: z.literal(true),
+  stopEvidence: z.string().trim().min(20).max(12000),
+}).strict();
+
 export const retryWorkspaceExportSchema = z.object({
   actionId: z.string().guid(),
   runId: z.string().guid(),
@@ -737,6 +746,7 @@ const createIssueBaseSchema = z.object({
     .enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES)
     .optional()
     .nullable(),
+  workspaceSelection: taskWorkspaceSelectionSchema.optional(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema
     .optional()
     .nullable(),
@@ -884,6 +894,7 @@ const issueCommentAttachmentIdsSchema = z
 
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
+    workspaceSelection: true,
     createdByUserId: true,
     responsibleUserId: true,
     watchdog: true,

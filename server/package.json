@@ -40,10 +40,11 @@
     "postpack": "rm -rf ui-dist",
     "clean": "rm -rf dist",
     "start": "node dist/index.js",
-    "prepare:runner-vendor": "pnpm --filter @paperclipai/paperclip-runner build",
+    "prepare:runner-vendor": "node scripts/prepare-runner-vendor.mjs",
     "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
   },
   "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.73.0",
     "@agentclientprotocol/codex-acp": "1.6.2",
     "@ai-sdk/amazon-bedrock": "5.0.113",
     "@ai-sdk/anthropic": "4.0.78",
@@ -113,6 +114,7 @@
     "zod": "^4.4.3"
   },
   "bundleDependencies": [
+    "@agentclientprotocol/claude-agent-acp",
     "@agentclientprotocol/codex-acp",
     "@chat-adapter/discord",
     "@chat-adapter/github",
@@ -123,6 +125,8 @@
     "acpx"
   ],
   "devDependencies": {
+    "@opentelemetry/context-async-hooks": "2.10.0",
+    "@opentelemetry/sdk-trace": "2.10.0",
     "@paperclipai/paperclip-runner": "workspace:*",
     "@types/compression": "^1.8.1",
     "@types/express": "^5.0.0",

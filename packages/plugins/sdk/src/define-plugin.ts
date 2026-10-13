@@ -51,7 +51,7 @@ import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paper
  * ```
  */
 
-import type { PluginContext } from "./types.js";
+import type { PluginContext, ResourceLifecycleEvent, ResourceLifecycleResult } from "./types.js";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -359,6 +359,14 @@ export interface PluginDefinition {
    * Calls can repeat. Fence older versions and make external effects idempotent.
    */
   onAgentLifecycle?(params: AgentLifecycleRequest): Promise<AgentLifecycleResult>;
+
+  /**
+   * Reconcile a committed resource event. Requires manifest resourceLifecycle and events.subscribe.
+   * The host acknowledges successful results and replays interrupted/unfinished work.
+   * Calls are at least once, in order per resource. Re-read current state and use
+   * idempotent external operations; deletion events remain available after the row is gone.
+   */
+  onResourceLifecycle?(event: ResourceLifecycleEvent): Promise<ResourceLifecycleResult>;
 
   /** Propose a member from host-authorized candidates. Requires ai.connections.route. */
   onRouteAiConnection?(params: AiConnectionRouterRequest): Promise<AiConnectionRouterResult>;

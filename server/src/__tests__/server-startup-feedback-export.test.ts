@@ -251,6 +251,12 @@ vi.mock("../app.js", () => ({
   createApp: createAppMock,
 }));
 
+// This suite exercises startup coordination; source persistence and authority
+// are covered by the database-backed source worker tests.
+vi.mock("../services/skill-source-sync.js", () => ({
+  skillSourceSyncService: () => ({ tick: vi.fn(async () => ({ imported: 0, checked: 0 })), stop: vi.fn(async () => {}) }),
+}));
+
 vi.mock("../services/native-runtime/native-session-executor.js", () => ({
   verifyStoppedNativeSessionForReplacement: vi.fn(async () => null),
 }));

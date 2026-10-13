@@ -408,8 +408,7 @@ export interface PluginExecutionWorkspaceMetadata {
   id: string;
   /** UUID of the owning company. */
   companyId: string;
-  /** UUID of the parent project. */
-  projectId: string;
+  projectId: string | null;
   /** UUID of the backing project workspace, when present. */
   projectWorkspaceId: string | null;
   /** Absolute filesystem path to the workspace when locally realized. */
@@ -548,7 +547,8 @@ export interface PluginLocalFoldersClient {
 export interface PluginEventsClient {
   /** Read durable resource hooks. Requires events.subscribe and a company scope.
    * Creation is delivered first, then the remaining events in id order.
-   * Page using afterId; reset it each polling sweep to retry failures and late commits.
+   * Prefer manifest resourceLifecycle + onResourceLifecycle for automatic delivery.
+   * Manual consumers page using afterId and restart pagination to revisit unacknowledged events.
    * Events repeat until acknowledged; use a company-scoped provider idempotency key.
    */
   listLifecycle(companyId: string, limit?: number, afterId?: string): Promise<ResourceLifecycleEvent[]>;
@@ -598,8 +598,17 @@ export type ResourceLifecycleEvent = {
   createdAt: string;
 } & (
   | { resourceType: "agent"; action: "create" | "pause" | "resume" | "terminate" }
-  | { resourceType: "project"; action: "create" | "update" | "archive" }
+  | { resourceType: "project"; action: "create" | "update" | "archive" | "delete" }
 );
+
+/** Return acknowledged only after durable effects finish. Retry unfinished work;
+ * defer when configuration is missing (replayed on configuration changes or startup).
+ * Both retry and deferred leave the event unacknowledged.
+ */
+export interface ResourceLifecycleResult {
+  eventId: string;
+  status: "acknowledged" | "retry" | "deferred";
+}
 
 /**
  * `ctx.jobs` — register handlers for scheduled jobs declared in the manifest.

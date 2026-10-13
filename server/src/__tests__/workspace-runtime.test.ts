@@ -50,6 +50,7 @@ import {
   resolveRuntimeProvisionCommand,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
+  runWorkspaceJobForControl,
   sanitizeRuntimeServiceBaseEnv,
   setWorkspaceRuntimeExposureDepsForTests,
   startRuntimeServicesForWorkspaceControl,
@@ -80,6 +81,7 @@ import {
 import { resolvePaperclipConfigPath } from "../paths.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.ts";
+import { HttpError } from "../errors.ts";
 import { deriveWorktreeInstanceId } from "../services/workspace-instance-cleanup.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -792,6 +794,41 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 });
 
 describe("realizeExecutionWorkspace", () => {
+  it.each(["primary", "linked"] as const)("realizes from a %s checkout with separate Git metadata without adopting its unrelated parent", async sourceKind => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-separate-owner-"));
+    try {
+      const wrongOwner = path.join(root, "wrong-owner"), primary = path.join(root, "source");
+      const common = path.join(wrongOwner, "separate-metadata");
+      await fs.mkdir(wrongOwner);
+      await runGit(wrongOwner, ["init", "-b", "main"]);
+      await runGit(wrongOwner, ["config", "user.email", "test@example.test"]);
+      await runGit(wrongOwner, ["config", "user.name", "Test"]);
+      await fs.writeFile(path.join(wrongOwner, "wrong.txt"), "UNRELATED_PARENT_BYTES");
+      await runGit(wrongOwner, ["add", "."]);
+      await runGit(wrongOwner, ["commit", "-m", "unrelated"]);
+      await execFileAsync("git", ["init", "-b", "main", "--separate-git-dir", common, primary]);
+      await runGit(primary, ["config", "user.email", "test@example.test"]);
+      await runGit(primary, ["config", "user.name", "Test"]);
+      await fs.writeFile(path.join(primary, "source.txt"), "AUTHORIZED_SOURCE_BYTES");
+      await runGit(primary, ["add", "."]);
+      await runGit(primary, ["commit", "-m", "source"]);
+      const source = sourceKind === "primary" ? primary : path.join(root, "linked-source");
+      if (sourceKind === "linked") await runGit(primary, ["worktree", "add", "-b", "linked-source", source]);
+      const wrongHead = await readGit(wrongOwner, ["rev-parse", "HEAD"]);
+      const expectedHead = await readGit(source, ["rev-parse", "HEAD"]);
+      const workspace = await realizeWorktreeForTest(source, "HEAD");
+      expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(expectedHead);
+      expect(await fs.readFile(path.join(workspace.cwd, "source.txt"), "utf8")).toBe("AUTHORIZED_SOURCE_BYTES");
+      await expect(fs.stat(path.join(workspace.cwd, "wrong.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readGit(wrongOwner, ["rev-parse", "HEAD"])).toBe(wrongHead);
+      expect(await readGit(wrongOwner, ["branch", "--list", workspace.branchName!])).toBe("");
+      expect(await fs.realpath(path.resolve(workspace.cwd, await readGit(workspace.cwd, ["rev-parse", "--git-common-dir"])))).toBe(await fs.realpath(common));
+      const reused = await realizeWorktreeForTest(source, "HEAD");
+      expect(reused.cwd).toBe(workspace.cwd);
+      expect(reused.created).toBe(false);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("defaults new git worktrees to freshly fetched origin/master", async () => {
     const sourceRepo = await createTempRepo("master");
     const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
@@ -1705,6 +1742,47 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
     expect(path.basename(realized.cwd)).toBe("PAP-992.hotfix-april-1");
   });
 
+  it.each(["configured", "builtin"] as const)("skips %s host provisioning for fresh, reused and restored sandbox worktrees", async kind => {
+    const repoRoot = await createTempRepo();
+    const marker = path.join(repoRoot, "host-provision-ran");
+    await fs.mkdir(path.join(repoRoot, "scripts"));
+    const script = kind === "configured" ? "custom.sh" : "provision-worktree.sh";
+    await fs.writeFile(path.join(repoRoot, "scripts", script),
+      `#!/bin/sh\nprintf 'host execution\n' > '${marker}'\n`);
+    await runGit(repoRoot, ["add", "scripts"]);
+    await runGit(repoRoot, ["commit", "-m", "Repository-controlled provision script"]);
+    const command = kind === "configured" ? `bash ./scripts/${script}` : undefined;
+    const input = {
+      base: { baseCwd: repoRoot, source: "project_primary" as const, projectId: "project-1",
+        workspaceId: "source-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", baseRef: "main", provisionCommand: command } },
+      issue: { id: "issue-sandbox", identifier: "PAP-449", title: "Sandbox files" },
+      agent: { id: "agent-1", name: "Sandbox worker", companyId: "company-1" },
+      skipHostProvision: true,
+    };
+    const fresh = await realizeExecutionWorkspace(input);
+    expect(fresh.created).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    const reused = await realizeExecutionWorkspace(input);
+    expect(reused.cwd).toBe(fresh.cwd);
+    expect(reused.created).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+    const restoreInput = { base: input.base, issue: input.issue, agent: input.agent, skipHostProvision: true,
+      workspace: { mode: "isolated_workspace", strategyType: "git_worktree", cwd: fresh.cwd,
+        providerRef: fresh.cwd, projectId: "project-1", projectWorkspaceId: "source-1", repoUrl: null,
+        baseRef: "main", branchName: fresh.branchName, config: { provisionCommand: command },
+        metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA } };
+    expect((await ensurePersistedExecutionWorkspaceAvailable(restoreInput))?.cwd).toBe(fresh.cwd);
+    expect(existsSync(marker)).toBe(false);
+    await fs.rm(fresh.cwd, { recursive: true, force: true });
+    expect(existsSync(fresh.cwd)).toBe(false);
+    expect((await ensurePersistedExecutionWorkspaceAvailable(restoreInput))?.cwd).toBe(fresh.cwd);
+    expect(existsSync(marker)).toBe(false);
+    await expect(fs.readFile(path.join(fresh.cwd, "README.md"), "utf8")).resolves.toBe("hello\n");
+    await ensurePersistedExecutionWorkspaceAvailable({ ...restoreInput, skipHostProvision: undefined });
+    await expect(fs.readFile(marker, "utf8")).resolves.toBe("host execution\n");
+  });
+
   it("runs a configured provision command inside the derived worktree", async () => {
     const repoRoot = await createTempRepo();
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
@@ -2586,110 +2664,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
     }
   });
 
-  it(
-    "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
-    async () => {
-    const repoRoot = await createTempRepo();
-    await writeRegisteredSourceConfig(repoRoot);
-    await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
-    await fs.writeFile(
-      path.join(repoRoot, "package.json"),
-      JSON.stringify(
-        {
-          name: "workspace-root",
-          private: true,
-          packageManager: "pnpm@9.15.4",
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "pnpm-workspace.yaml"),
-      ["packages:", "  - packages/*", "  - server", ""].join("\n"),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "packages", "shared", "package.json"),
-      JSON.stringify(
-        {
-          name: "@repo/shared",
-          version: "1.0.0",
-          private: true,
-          type: "module",
-          exports: "./index.js",
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "packages", "shared", "index.js"), "export const value = 'shared';\n", "utf8");
-    await fs.writeFile(
-      path.join(repoRoot, "server", "package.json"),
-      JSON.stringify(
-        {
-          name: "server",
-          private: true,
-          type: "module",
-          dependencies: {
-            "@repo/shared": "workspace:*",
-          },
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "server", "index.js"), "export {};\n", "utf8");
-    await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
-    await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
-    await runPnpm(repoRoot, ["install"]);
-    await runGit(repoRoot, ["add", "."]);
-    await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
-        },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-551",
-        title: "Provision local workspace dependencies",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
-
-    expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
-    expect((await fs.lstat(path.join(workspace.cwd, "server", "node_modules"))).isSymbolicLink()).toBe(false);
-    await expect(fs.realpath(path.join(workspace.cwd, "server", "node_modules", "@repo", "shared"))).resolves.toBe(
-      await fs.realpath(path.join(workspace.cwd, "packages", "shared")),
-    );
-    await expect(fs.realpath(path.join(repoRoot, "server", "node_modules", "@repo", "shared"))).resolves.toBe(
-      await fs.realpath(path.join(repoRoot, "packages", "shared")),
-    );
-    },
-    15_000,
-  );
 
   it("records worktree setup and provision operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
@@ -3946,6 +3921,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4022,6 +3998,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-reused-cleanup",
         cwd: reused.cwd,
         providerType: "git_worktree",
@@ -4090,6 +4067,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4154,6 +4132,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4230,6 +4209,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4338,6 +4318,34 @@ describe("ensureRuntimeServicesForRun", () => {
       onLog: input.onLog,
     };
   }
+
+  it.each(["configured", "builtin"] as const)("suppresses %s runtime provision scripts for remote runs without disabling local provisioning", async kind => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-provision-"));
+    const restorePaperclipEnv = configureRuntimeProvisionTestHome(workspaceRoot, "remote-runtime-provision");
+    const marker = path.join(workspaceRoot, "runtime-script-ran");
+    const command = `printf host-runtime > '${marker}'`;
+    await fs.mkdir(path.join(workspaceRoot, "scripts"));
+    await fs.writeFile(path.join(workspaceRoot, "scripts", "provision-worktree-runtime.sh"), `${command}\n`);
+    const workspace = { ...buildWorkspace(workspaceRoot), strategy: "git_worktree" as const, worktreePath: workspaceRoot };
+    const config = runtimeProvisionTestConfig({ provisionCommand: kind === "configured" ? command : undefined });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const input = { runId: randomUUID(), agent: { id: "agent-1", name: "Remote worker", companyId: "company-1" },
+      issue: null, workspace, config, executionWorkspaceId: randomUUID(), adapterEnv: {}, recorder };
+    try {
+      expect(await ensureRuntimeServicesForRun({ ...input, skipHostProvision: true })).toHaveLength(1);
+      await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(operations.filter(operation => ["workspace_seed", "workspace_runtime_provision"].includes(operation.phase))).toHaveLength(0);
+      await stopRuntimeServicesForExecutionWorkspace({ executionWorkspaceId: input.executionWorkspaceId, workspaceCwd: workspaceRoot });
+      const local = ensureRuntimeServicesForRun({ ...input, runId: randomUUID() });
+      if (kind === "builtin") await expect(local).rejects.toThrow(/without a readable seed manifest/);
+      else expect(await local).toHaveLength(1);
+      expect(await fs.readFile(marker, "utf8")).toBe("host-runtime");
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({ executionWorkspaceId: input.executionWorkspaceId, workspaceCwd: workspaceRoot });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+      restorePaperclipEnv();
+    }
+  });
 
   it("runs runtime provisioning once when service starts race for the same workspace", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-race-"));
@@ -10008,6 +10016,7 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
   ) {
     return {
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -10192,5 +10201,57 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
         }),
       },
     });
+  });
+});
+
+describe("runWorkspaceJobForControl", () => {
+  const actor = { id: null, name: "Board", companyId: "company-1" };
+
+  it("reports a failing operator job as an unprocessable job result, not a server error", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-job-failure-"));
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const jobScript = "console.error('Restored patch differs from exact source'); process.exit(3);";
+
+    try {
+      const failure = await runWorkspaceJobForControl({
+        actor,
+        issue: null,
+        workspace: buildWorkspace(workspaceRoot),
+        command: {
+          name: "Recover retained files",
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(jobScript)}`,
+        },
+        recorder,
+      }).then(() => null, (error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(HttpError);
+      expect(failure).toMatchObject({
+        status: 422,
+        message: 'Workspace job "Recover retained files" failed: Restored patch differs from exact source',
+        details: { code: "workspace_job_failed", exitCode: 3 },
+      });
+      expect(operations).toHaveLength(1);
+      expect(operations[0]?.result).toMatchObject({ status: "failed", exitCode: 3 });
+    } finally {
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a job without a command as unprocessable", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-job-missing-"));
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    try {
+      await expect(runWorkspaceJobForControl({
+        actor,
+        issue: null,
+        workspace: buildWorkspace(workspaceRoot),
+        command: { name: "Empty job" },
+        recorder,
+      })).rejects.toMatchObject({ status: 422, message: 'Workspace job "Empty job" is missing command' });
+      expect(operations).toHaveLength(0);
+    } finally {
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
   });
 });

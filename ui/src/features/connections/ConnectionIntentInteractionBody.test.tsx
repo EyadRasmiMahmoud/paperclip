@@ -628,6 +628,15 @@ describe("AI repair inside the card", () => {
     expect(document.body.textContent).toContain("Dotta must reconnect My Codex account");
     expect(document.querySelector('[data-testid="shared-ai-credentials"]')).toBeNull();
   });
+  it("shows a withdrawn AI request as terminal without another setup action", () => {
+    renderBody({ ...interaction, status: "cancelled", resolvedAt: new Date() });
+    expect(document.body.textContent).toContain("Connection request withdrawn");
+    expect(document.body.textContent).not.toContain("This task can’t run");
+    expect(button("Fix connection")).toBeUndefined();
+    expect(document.querySelector('[data-testid="connection-intent-terminal"]')).not.toBeNull();
+    expect(setupOptionsMock).not.toHaveBeenCalled();
+    expect(credentialRender).not.toHaveBeenCalled();
+  });
   it("does not promise to run without credentials when declined", () => {
     renderBody({ ...interaction, status: "rejected" });
     expect(document.body.textContent).toContain("The task still needs a working AI connection");

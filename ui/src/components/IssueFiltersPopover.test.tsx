@@ -65,7 +65,7 @@ describe("IssueFiltersPopover", () => {
           agents={[{ id: "agent-1", name: "Agent One" }]}
           projects={[{ id: "project-1", name: "Project One" }]}
           labels={[{ id: "label-1", name: "Bug", color: "#ff0000" }]}
-          enableRoutineVisibilityFilter
+          enableAgentCreatedVisibilityFilter
         />,
       );
     });
@@ -98,7 +98,7 @@ describe("IssueFiltersPopover", () => {
           agents={[{ id: "agent-1", name: "Agent One" }]}
           projects={[{ id: "project-1", name: "Project One" }]}
           labels={[{ id: "label-1", name: "Bug", color: "#ff0000" }]}
-          enableRoutineVisibilityFilter
+          enableAgentCreatedVisibilityFilter
         />,
       );
     });
@@ -108,6 +108,9 @@ describe("IssueFiltersPopover", () => {
     // Status section still renders, Priority section is gated off (PAP-411).
     expect(popoverContent?.textContent).toContain("Status");
     expect(popoverContent?.textContent).not.toContain("Priority");
+    const creationToggle = Array.from(popoverContent?.querySelectorAll("label") ?? []).find((label) => label.textContent?.includes("show agent-created tasks"));
+    expect(creationToggle?.textContent).toBe("show agent-created tasks");
+    expect(creationToggle?.querySelector("input")?.checked).toBe(false);
   });
 
   it("searches long option lists while the popover remains the only scroll owner", () => {

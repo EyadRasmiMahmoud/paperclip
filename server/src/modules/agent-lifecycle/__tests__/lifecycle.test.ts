@@ -481,7 +481,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(pluginCompanySettings).set({ enabled: true }).where(eq(pluginCompanySettings.pluginId, pluginId));
     expect(await driver.runPlugin(snapshot, pluginId)).toBe("complete");
     expect(call).toHaveBeenCalledWith(pluginId, "agentLifecycle", { companyId, agentId: agent.id,
-      operationId: snapshot.lifecycleOperation!.id, version: snapshot.lifecycleVersion, phase: "paused" }, 30_000);
+      operationId: snapshot.lifecycleOperation!.id, version: snapshot.lifecycleVersion, phase: "paused", instanceSecrets: {} }, 30_000);
     call.mockResolvedValueOnce({ operationId: "stale", version: snapshot.lifecycleVersion, status: "complete" });
     await expect(driver.runPlugin(snapshot, pluginId)).rejects.toThrow("Invalid lifecycle result");
   });

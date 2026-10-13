@@ -118,6 +118,8 @@ export interface HeartbeatRuntimeSelectionInput {
     activeEnvironmentLease: Pick<Parameters<typeof prepareNativeWorkspaceSync>[0], "lease">;
     isDotRun: boolean;
     projectRepositoryPaths: string[];
+    onCheckpoint?: Parameters<typeof prepareNativeWorkspaceSync>[0]["onCheckpoint"];
+    onPhase?: Parameters<typeof prepareNativeWorkspaceSync>[0]["onPhase"];
   };
   config: {
     runtimeConfig: Record<string, unknown>;
@@ -534,6 +536,16 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         throw new Error(
           "native_execution_input_persisted_binding_mismatch",
         );
+      if ("runtimeContext" in nativeExecution) {
+        const savedVersions = parseObject(run.contextSnapshot?.skillVersions);
+        const accessibleKeys = new Set(runtimeSkillEntries.filter(entry => entry.sourceStatus !== "missing").map(entry => entry.key));
+        if (nativeExecution.runtimeContext.skills.some(skill =>
+          Object.prototype.hasOwnProperty.call(savedVersions, skill.key) && !accessibleKeys.has(skill.key))) {
+          throw new ConfigurationIncompleteFailure("Project skill access changed while this execution was suspended. Restore access or start a new execution.", {
+            configurationIncomplete: { reason: "skill_access_changed", actionUrl: "/skills" },
+          });
+        }
+      }
       // Recover only the originally admitted request. A stored idle
       // checkpoint can precede an already-started provider turn, so even
       // apparent idleness is not authority to rewrite its contract.
@@ -1014,6 +1026,8 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       restartRecovery: runOptions.nativeRestartRecovery,
       sameRunRecovery: Boolean(runOptions.nativeLeaseOwner),
       resourceDisposition: providerResourceDispositionForRun,
+      onCheckpoint: input.workspace.onCheckpoint,
+      onPhase: input.workspace.onPhase,
     });
   } else {
     const legacyWarmLifecycle =

@@ -246,6 +246,12 @@ export function ConnectionIntentInteractionBody({
           title: accessRequest ? `${serviceName} access granted` : interaction.payload.upstreamService ? "External provider connected" : `${serviceName} connected`,
           body: accessRequest ? null : interaction.payload.upstreamService ? `${interaction.payload.requestingAgentName} can now verify and authorize ${interaction.payload.upstreamService.name} through this provider. The app is not yet verified.` : isAi ? "This agent can now use the connection." : `${interaction.payload.requestingAgentName} can use this connection on the continuation run.`,
         }
+      : interaction.status === "cancelled"
+        ? {
+            icon: XCircle,
+            title: "Connection request withdrawn",
+            body: "This request is no longer active.",
+          }
       : interaction.status === "rejected"
         ? {
             icon: XCircle,

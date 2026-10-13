@@ -50,10 +50,12 @@ const apiPrefixes: Record<string, string> = {
   "decision-training.ts": "/api",
   "environments.ts": "/api",
   "execution-workspaces.ts": "/api",
+  "task-workspaces.ts": "/api",
   "file-resources.ts": "/api",
   "folders.ts": "/api",
   "goals.ts": "/api",
   "health.ts": "/api/health",
+  "liveness.ts": "/api/liveness",
   "inbox-agent-policy.ts": "/api",
   "inbox-dismissals.ts": "/api",
   "instance-database-backups.ts": "/api",
@@ -86,9 +88,9 @@ const apiPrefixes: Record<string, string> = {
 };
 
 const ROUTE_LITERAL_PATTERN =
-  /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
-const ROUTE_ARRAY_PATTERN = /router\.(get|post|put|patch|delete)\(\s*\[([^\]]+)\]/g;
-const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
+  /router\.(get|head|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
+const ROUTE_ARRAY_PATTERN = /router\.(get|head|post|put|patch|delete)\(\s*\[([^\]]+)\]/g;
+const ROUTER_METHOD_PATTERN = /router\.(get|head|post|put|patch|delete)\(/;
 const HTTP_METHODS = new Set([
   "get",
   "put",
@@ -182,7 +184,7 @@ function resolveMountedPath(file: string, prefix: string, routePath: string) {
   ) {
     return routePath;
   }
-  if ((file === "companies.ts" || file === "health.ts") && routePath === "/") {
+  if ((file === "companies.ts" || file === "health.ts" || file === "liveness.ts") && routePath === "/") {
     return prefix;
   }
   if (file === "companies.ts" || file === "health.ts") {
@@ -295,6 +297,17 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents anonymous liveness separately from database readiness", () => {
+    const spec = buildOpenApiSpec() as any;
+    for (const method of ["get", "head"]) {
+      const operation = spec.paths["/api/liveness"][method];
+      expect(operation.security).toEqual([]);
+      expect(operation.responses[503]).toBeDefined();
+    }
+    expect(Object.keys(spec.paths["/api/liveness"].get.responses[200].content["application/json"].schema.properties))
+      .toEqual(["status", "commit"]);
+    expect(spec.paths["/api/health"].get.responses[503]).toBeDefined();
+  });
   it("documents only writable agent update fields and lifecycle status requests", () => {
     const document = buildOpenApiSpec() as any;
     const properties = document.paths["/api/agents/{id}"].patch.requestBody.content["application/json"].schema.properties;

@@ -73,6 +73,38 @@ describe("isWorkerEntrypoint", () => {
   });
 });
 
+describe("worker resource lifecycle delivery", () => {
+  it("advertises and dispatches the native lifecycle callback", async () => {
+    const stdin = new PassThrough(), stdout = new PassThrough();
+    const lines = createInterface({ input: stdout });
+    const plugin = definePlugin({
+      async setup() {},
+      async onResourceLifecycle(event) { return { eventId: event.id, status: "retry" }; },
+    });
+    const worker = startWorkerRpcHost({ plugin, stdin, stdout });
+    async function call(method: string, params: unknown) {
+      const response = new Promise<JsonRpcResponse>(resolve => {
+        const handler = (line: string) => {
+          const message = parseMessage(line);
+          if (isJsonRpcResponse(message)) { lines.off("line", handler); resolve(message); }
+        };
+        lines.on("line", handler);
+      });
+      stdin.write(serializeMessage(createRequest(method, params, method)));
+      return response;
+    }
+    try {
+      const initialized = await call("initialize", {
+        manifest: { id: "test.lifecycle", apiVersion: 1, version: "1.0.0", displayName: "Lifecycle", description: "Test", author: "Tests", categories: ["automation"], capabilities: ["events.subscribe"], resourceLifecycle: ["project"], entrypoints: { worker: "worker.js" } },
+        config: {}, databaseNamespace: null,
+      });
+      expect(initialized).toMatchObject({ result: { supportedMethods: expect.arrayContaining(["resourceLifecycle"]) } });
+      expect(await call("resourceLifecycle", { id: "17", companyId: "company", resourceType: "project", resourceId: "project", action: "delete", createdAt: "2020-01-01T00:00:00Z" }))
+        .toMatchObject({ result: { eventId: "17", status: "retry" } });
+    } finally { worker.stop(); lines.close(); stdin.destroy(); stdout.destroy(); }
+  });
+});
+
 describe("worker performAction context", () => {
   it("does not derive context companyId from caller params without host actor context", async () => {
     const hostToWorker = new PassThrough();

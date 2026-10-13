@@ -105,6 +105,7 @@ import {
   type AcpRuntimeUsageCost,
 } from "acpx/runtime";
 import {
+  ACP_TOOL_KINDS,
   ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS,
   ACPX_HANDSHAKE_TIMEOUT_MS,
   ACPX_HANDSHAKE_TRANSPORT_POLL_MS,
@@ -129,6 +130,7 @@ import type {
   TurnCompletion,
 } from "./run-contracts.js";
 import { createRunResourceLedger } from "./run-resource-ledger.js";
+import { acpxAccountingModel } from "./accounting-model.js";
 import { settleAcpRun, type SettlementSteps } from "./settlement-sequence.js";
 import {
   runAttempt,
@@ -3248,6 +3250,46 @@ async function emitRuntimeEvent(
   }
 }
 
+function isPendingAcpTool(tool: { status?: string }): boolean {
+  return tool.status !== "completed" && tool.status !== "failed" && tool.status !== "cancelled";
+}
+
+/**
+ * Activity as of the moment the turn's stop fired, for a stopped turn only.
+ * Separates a turn that went silent long before its deadline from one that
+ * was still working. Reports only ages and closed ACP tool-kind labels.
+ */
+export function summarizeAcpStopActivity(
+  stopRequestedAt: number | null,
+  lastEventBeforeStopAt: number | null,
+  pendingTools: ReadonlyArray<{ kind?: string; firstSeenAt?: number }>,
+): { acpLastEventAgeAtStopMs?: number; acpOldestPendingToolAgeAtStopMs?: number; acpPendingToolKinds?: string } {
+  const summary: ReturnType<typeof summarizeAcpStopActivity> = {};
+  if (pendingTools.length > 0) {
+    const knownKinds: readonly string[] = ACP_TOOL_KINDS;
+    summary.acpPendingToolKinds = uniqueSorted(
+      pendingTools.map((tool) => (tool.kind && knownKinds.includes(tool.kind) ? tool.kind : "unknown")),
+    ).join(",");
+  }
+  if (stopRequestedAt === null) return summary;
+  const age = (since: number) => {
+    const value = stopRequestedAt - since;
+    return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  };
+  if (lastEventBeforeStopAt !== null) {
+    const value = age(lastEventBeforeStopAt);
+    if (value !== undefined) summary.acpLastEventAgeAtStopMs = value;
+  }
+  const pendingSince = pendingTools
+    .map((tool) => tool.firstSeenAt)
+    .filter((at): at is number => typeof at === "number" && at <= stopRequestedAt);
+  if (pendingSince.length > 0) {
+    const value = age(Math.min(...pendingSince));
+    if (value !== undefined) summary.acpOldestPendingToolAgeAtStopMs = value;
+  }
+  return summary;
+}
+
 function resultErrorMessage(result: AcpRuntimeTurnResult): string | null {
   if (result.status !== "failed") return null;
   return result.error.message;
@@ -4045,7 +4087,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     let runtimeStopConfirmed = false;
     let safeInterruptedSession = false;
     let preserveInterruptedSession = false;
-    const interruptionTools = new Map<string, { kind?: string; status?: string }>();
+    const interruptionTools = new Map<string, { kind?: string; status?: string; firstSeenAt?: number }>();
     let incompleteToolInventory = false;
     try {
       await ctx.onCancellationReady?.();
@@ -4758,6 +4800,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let observedUsage: Pick<AdapterExecutionResult, "usage" | "usageBasis" | "costUsd" | "usageComplete"> = { usageComplete: false };
       let lastRuntimeEventAt: number | null = null;
       let observedRuntimeEvents = 0;
+      // Activity as of the moment the turn's stop (wall-clock timeout or
+      // operator stop) fired. The cancel can make the agent emit closing
+      // events (including updates that close the stalled tool), so the
+      // finalize-time age and pending set alone cannot tell a silent stall
+      // from live work.
+      let turnStopRequestedAt: number | null = null;
+      let lastRuntimeEventBeforeStopAt: number | null = null;
+      let pendingToolsAtStop: Array<{ kind?: string; firstSeenAt?: number }> | null = null;
       let turnDispatchAttempted = false;
       // The turn-local state the sequence steps share. `promptBuild` sets the
       // prompt, `preTurnUsage` sets the pre-turn status, `turnStart` sets the
@@ -4765,6 +4815,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // scoped hoisted local, so the settlement `endSession` step can cancel it.
       let runPrompt = "";
       let preTurnStatus: AcpRuntimeStatus | null = null;
+      let accountingModel: string | null = prepared.requestedModel || null;
       // Phase-timing markers for the prepare_turn and turn phases. The prepare
       // phase covers the prompt build and the pre-turn usage snapshot; the turn
       // phase covers the started turn and the event relay.
@@ -4836,6 +4887,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // Snapshot pre-turn usage so cumulative agent-reported cost can be
         // attributed to this run alone.
         preTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
+        accountingModel = acpxAccountingModel(prepared.requestedModel, preTurnStatus, null);
         // The prepare phase (prompt build + usage snapshot) finished; the turn
         // phase starts next.
         await emitPhase("prepare_turn", preparePhaseStart, "ok");
@@ -4843,6 +4895,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       };
       const stepTurnStart = (signal: AbortSignal, startTimeoutMs: number | undefined): StartedTurn => {
         ctx.signal?.throwIfAborted();
+        signal.addEventListener("abort", () => {
+          if (turnStopRequestedAt !== null) return;
+          turnStopRequestedAt = now();
+          pendingToolsAtStop = [...interruptionTools.values()].filter(isPendingAcpTool);
+        }, { once: true });
         // After entering startTurn, a thrown error cannot prove the provider
         // received no work. Only failures before this boundary are free to settle.
         turnDispatchAttempted = true;
@@ -4936,6 +4993,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const drainEvents = (async (): Promise<void> => {
           for await (const event of turn.events) {
             lastRuntimeEventAt = now();
+            if (turnStopRequestedAt === null) lastRuntimeEventBeforeStopAt = lastRuntimeEventAt;
             observedRuntimeEvents += 1;
             // ACPX currently flattens client-side filesystem/terminal receipts
             // into status text. They cannot establish complete action outcomes.
@@ -4947,6 +5005,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 interruptionTools.set(event.toolCallId, {
                   kind: event.kind ?? previous?.kind,
                   status: event.status ?? previous?.status,
+                  firstSeenAt: previous?.firstSeenAt ?? lastRuntimeEventAt,
                 });
               }
             }
@@ -4965,7 +5024,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               const checkpoint = summarizeAcpxTurnUsage({ preStatus: preTurnStatus, postStatus: null, eventBreakdown, eventCostUsd });
               observedUsage = { usage: checkpoint.usage ?? undefined, costUsd: checkpoint.costUsd, usageBasis: "per_run", usageComplete: false };
               await ctx.onUsage?.({ ...billingFields, usage: checkpoint.usage ?? undefined, costUsd: checkpoint.costUsd,
-                model: prepared.requestedModel, usageBasis: "per_run", complete: false });
+                model: accountingModel, usageBasis: "per_run", complete: false });
             }
             await emitRuntimeEvent(ctx, event, toolTitles, prepared.coalescePlaceholderToolUpdates);
           }
@@ -5001,14 +5060,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // Capture runtime activity before usage reads, error logs, or cleanup
         // make an otherwise silent turn look active at its execution deadline.
         const lastEventAgeMs = lastRuntimeEventAt === null ? undefined : now() - lastRuntimeEventAt;
+        const pendingTools = [...interruptionTools.values()].filter(isPendingAcpTool);
         const activityDiagnostics = {
           acpObservedEventCount: observedRuntimeEvents,
           ...(lastEventAgeMs !== undefined && Number.isSafeInteger(lastEventAgeMs) && lastEventAgeMs >= 0
             ? { acpLastEventAgeMs: lastEventAgeMs } : {}),
-          acpPendingToolCount: [...interruptionTools.values()].filter(
-            (tool) => tool.status !== "completed" && tool.status !== "failed" && tool.status !== "cancelled",
-          ).length,
+          acpPendingToolCount: pendingTools.length,
           acpToolInventoryComplete: !incompleteToolInventory,
+          ...summarizeAcpStopActivity(turnStopRequestedAt, lastRuntimeEventBeforeStopAt, pendingToolsAtStop ?? pendingTools),
         };
         if (input.kind === "terminal") {
         const terminal = input.terminal;
@@ -5046,6 +5105,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost;
         // Read usage before the settlement can discard runtime state.
         const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
+        accountingModel = acpxAccountingModel(prepared.requestedModel, preTurnStatus, postTurnStatus);
         const turnUsage = summarizeAcpxTurnUsage({
           preStatus: preTurnStatus,
           postStatus: postTurnStatus,
@@ -5057,7 +5117,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const usageComplete = !channelLost && (turnSucceeded || postTurnStatus?.usage != null);
         observedUsage = { usage: turnUsage.usage ?? undefined, costUsd: turnUsage.costUsd, usageBasis: "per_run", usageComplete };
         await ctx.onUsage?.({ ...billingFields, usage: turnUsage.usage ?? undefined, costUsd: turnUsage.costUsd,
-          model: prepared.requestedModel, usageBasis: "per_run", complete: usageComplete });
+          model: accountingModel, usageBasis: "per_run", complete: usageComplete });
         const failedTurn = terminal.status === "failed" || terminal.status === "cancelled" || timedOut;
         // ACPX can defer session/load until runTurn. Forget an unavailable
         // session so the next bounded turn receives the full task conversation.
@@ -5140,7 +5200,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           ...billingFields,
           ...referencedProjectStagingFailuresField,
-          model: prepared.requestedModel || null,
+          model: accountingModel,
           ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
           costUsd: turnUsage.costUsd,
           usageComplete,
@@ -5281,7 +5341,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...(!turnDispatchAttempted ? { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } } : {}),
           ...billingFields,
           ...referencedProjectStagingFailuresField,
-          model: prepared.requestedModel || null,
+          model: accountingModel,
           clearSession: clearSession || timedOut,
           resultJson: { phase, ...activityDiagnostics },
           summary: message,

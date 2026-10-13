@@ -1,3 +1,5 @@
+import { skillAccessService } from "../skill-access.js";
+import { callTaskWorkspaceTool } from "../task-workspace-tools.js";
 import { TaskAttachmentReadCache, TASK_ATTACHMENT_DEFINITIONS, TASK_ATTACHMENT_SCHEMAS, listTaskAttachments, readTaskAttachment } from "./runner-task-attachments.js";
 import { RUNNER_BRIDGE_SCHEMAS, runnerBridgeDefinitions, readAssignedSkill, executeWorkspaceTool, readWorkspaceUploadFile, settleRunnerBridgeRead, assertRunnerWorkspacePathAllowed } from "./runner-bridge-tools.js";
 import type { NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
@@ -41,6 +43,9 @@ import { createLocalAgentJwt } from "../../agent-auth-jwt.js";
 import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
 import { assetService } from "../assets.js";
+import { canActorReadAssetContent } from "../asset-content-access.js";
+import { getSecretProvider } from "../../secrets/provider-registry.js";
+import { runnerApiSensitiveResponse } from "./runner-api-sensitive-response.js";
 import { workspaceFileResourceService } from "../workspace-file-resources.js";
 import { badRequest, forbidden, notFound, HttpError } from "../../errors.js";
 import { runnerApiCatalog, searchRunnerApi } from "./runner-api-catalog.js";
@@ -51,6 +56,7 @@ import type { Db } from "@paperclipai/db";
 import {
   authUsers,
   companyMemberships,
+  companySkills,
   activityLog,
   assets,
   runnerApiResponseReservations,
@@ -110,7 +116,7 @@ const IMPLEMENTED_OPERATIONS = new Set([
   "search_api", "call_api", "hire_agent",
   "get_task_context", "get_task_history", "search_tasks", "report_progress", "set_task_title", "set_task_monitor",
   "request_human_input",
-  "create_skill", "update_skill", "create_task", "reassign_task", "set_dependencies", "create_project", "list_project_repositories", "list_projects", "register_deliverable",
+  "get_workspace", "list_workspaces", "select_workspace", "prepare_repository", "create_skill", "update_skill", "create_task", "reassign_task", "set_dependencies", "create_project", "list_project_repositories", "list_projects", "register_deliverable",
   "list_documents", "read_document", "list_document_revisions", "write_document",
   "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
 ]);
@@ -346,8 +352,19 @@ export class PaperclipRunnerToolAuthority {
         .innerJoin(authUsers, eq(authUsers.id, companyMemberships.principalId))
         .where(and(eq(companyMemberships.companyId, this.binding.companyId), eq(companyMemberships.principalType, "user"), eq(companyMemberships.status, "active"), input.after ? sql`${authUsers.id} > ${input.after}` : undefined))
         .orderBy(authUsers.id).limit(input.limit);
-      if (call.tool === "list_assigned_skills") return this.binding.runtimeContext!.skills.map(skill => ({ key: skill.key, name: skill.runtimeName, versionId: skill.versionId, digest: skill.bundle.digest }));
-      if (call.tool === "read_assigned_skill") return settleRunnerBridgeRead(() => readAssignedSkill(this.binding.runtimeContext!, input));
+      if (call.tool === "list_assigned_skills" || call.tool === "read_assigned_skill") {
+        const current = await this.#boundContext();
+        const visibility = await skillAccessService(this.db, this.#privacyActor(current.run)).condition(this.binding.companyId);
+        const known = await this.db.select({ key: companySkills.key }).from(companySkills).where(eq(companySkills.companyId, this.binding.companyId));
+        const permitted = await this.db.select({ key: companySkills.key }).from(companySkills).where(and(eq(companySkills.companyId, this.binding.companyId), visibility));
+        const hidden = new Set(known.filter(skill => !permitted.some(allowed => allowed.key === skill.key)).map(skill => skill.key));
+        const savedVersions = current.run.contextSnapshot?.skillVersions;
+        const permittedKeys = new Set(permitted.map(skill => skill.key));
+        const runtimeContext = { ...this.binding.runtimeContext!, skills: this.binding.runtimeContext!.skills.filter(skill =>
+          !hidden.has(skill.key) && !(savedVersions && Object.prototype.hasOwnProperty.call(savedVersions, skill.key) && !permittedKeys.has(skill.key))) };
+        if (call.tool === "list_assigned_skills") return runtimeContext.skills.map(skill => ({ key: skill.key, name: skill.runtimeName, versionId: skill.versionId, digest: skill.bundle.digest }));
+        return settleRunnerBridgeRead(() => readAssignedSkill(runtimeContext, input));
+      }
       const paths: Record<string, [string, string]> = { get_task: ["GET", "/api/issues/{id}"], comment_on_task: ["POST", "/api/issues/{id}/comments"],
         list_task_documents: ["GET", "/api/issues/{id}/documents"], read_task_document: ["GET", "/api/issues/{id}/documents/{key}"], write_task_document: ["PUT", "/api/issues/{id}/documents/{key}"] };
       const [method, path] = paths[call.tool]!;
@@ -497,21 +514,30 @@ export class PaperclipRunnerToolAuthority {
       }
       case "create_skill": {
         const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
-        const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, context.actor.adapterType, this.binding.runId, context.run.responsibleUserId);
+        const token = this.#apiToken(context);
         if (!apiUrl || !token) throw new Error("Skill tool authentication is unavailable");
         return callCreateSkillTool({ arguments: input, apiUrl, token, companyId: this.binding.companyId });
       }
       case "update_skill": {
         const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
-        const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, context.actor.adapterType, this.binding.runId, context.run.responsibleUserId);
+        const token = this.#apiToken(context);
         if (!apiUrl || !token) throw new Error("Skill tool authentication is unavailable");
         return callUpdateSkillTool({ arguments: input, apiUrl, token, companyId: this.binding.companyId });
+      }
+      case "get_workspace":
+      case "list_workspaces":
+      case "select_workspace":
+      case "prepare_repository": {
+        const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
+        const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, context.actor.adapterType, this.binding.runId, context.run.responsibleUserId);
+        if (!apiUrl || !token) throw new Error("Workspace tool authentication is unavailable");
+        return callTaskWorkspaceTool({ name: call.tool, arguments: input, apiUrl, token, companyId: this.binding.companyId, issueId: this.binding.issueId, workspaceRoot: this.binding.workspaceRoot });
       }
       case "create_project":
       case "list_project_repositories":
       case "list_projects": {
         const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
-        const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, context.actor.adapterType, this.binding.runId, context.run.responsibleUserId);
+        const token = this.#apiToken(context);
         if (!apiUrl || !token) throw new Error("Project tool authentication is unavailable");
         return callProjectTool({ name: call.tool, arguments: input, apiUrl, token,
           companyId: this.binding.companyId, issueId: this.binding.issueId, agentId: this.binding.agentId,
@@ -693,14 +719,35 @@ export class PaperclipRunnerToolAuthority {
     return result;
   }
 
+  #apiScope(context: {
+    issue: { workMode: string };
+    run: { contextSnapshot: unknown };
+  }) {
+    const snapshot = record(context.run.contextSnapshot);
+    const admittedKind = record(snapshot.paperclipAgentJwtScope).kind;
+    const skillTest = admittedKind === "skill_test" || (admittedKind !== "standard"
+      && (Boolean(snapshot.paperclipSkillTest) || context.issue.workMode === "skill_test"));
+    return skillTest ? { kind: "skill_test" as const, issueId: this.binding.issueId } : { kind: "standard" as const };
+  }
+
+  #apiToken(context: {
+    actor: { adapterType: string };
+    issue: { workMode: string };
+    run: { responsibleUserId: string | null; contextSnapshot: unknown };
+  }) {
+    return createLocalAgentJwt(this.binding.agentId, this.binding.companyId, context.actor.adapterType,
+      this.binding.runId, context.run.responsibleUserId, this.#apiScope(context));
+  }
+
   async #callApi(callId: string, value: unknown): Promise<unknown> {
     const bound = await this.#boundContext();
     const context = { ...this.binding, issueIdentifier: bound.issue.identifier, workMode: bound.issue.workMode };
     const { input, operation } = validateRunnerApiCall(value, context);
+    const sensitiveResponse = runnerApiSensitiveResponse(operation.method, operation.path);
     await this.#assertDotApiFileAccess(operation.path, input);
     const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
     if (!apiUrl) throw new Error("Paperclip API origin is unavailable");
-    const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, bound.actor.adapterType, this.binding.runId, bound.run.responsibleUserId);
+    const token = this.#apiToken(bound);
     if (!token) throw new Error("Paperclip run authentication is unavailable");
     const execute = async () => {
       let reservationId: string | undefined;
@@ -754,6 +801,8 @@ export class PaperclipRunnerToolAuthority {
     };
     if (["GET", "HEAD", "OPTIONS"].includes(operation.method)) return execute();
     if (!callId || callId.length > 500) throw badRequest("A bounded runner call id is required");
+    const provider = sensitiveResponse ? getSecretProvider("local_encrypted") : null;
+    if (provider) await provider.createSecret({ value: "runner-api-receipt-key-check" });
     // Reserve durably before HTTP dispatch, without holding a DB lock over an
     // HTTP route that itself needs DB locks. A crash leaves an explicit unknown
     // outcome rather than replaying a possibly committed external mutation.
@@ -766,6 +815,10 @@ export class PaperclipRunnerToolAuthority {
       const existing = record(receipts[key]);
       if (receipts[key]) {
         if (existing.digest !== digest) throw badRequest("API call id was reused with different arguments");
+        if (existing.encryptedResult) {
+          const text = await getSecretProvider("local_encrypted").resolveVersion({ material: record(existing.encryptedResult), externalRef: null });
+          return { result: JSON.parse(text) as unknown };
+        }
         return { result: existing.result ?? { ok: false, status: null, error: "api_outcome_unknown", outcome: "unknown", guidance: "Inspect state before issuing another mutation." } };
       }
       if (Object.keys(receipts).length >= 512) throw badRequest("Run API mutation limit reached");
@@ -775,6 +828,9 @@ export class PaperclipRunnerToolAuthority {
     });
     if (prior) return prior.result;
     const result = await execute();
+    const storedResult = provider
+      ? { encryptedResult: (await provider.createSecret({ value: JSON.stringify(result) })).material }
+      : { result };
     // Some older routes attribute the agent but omit runId. Retain their domain
     // event and add the run-bound HTTP receipt, without logging request bodies.
     const apiActivity = await persistActivity(this.db, {
@@ -788,7 +844,7 @@ export class PaperclipRunnerToolAuthority {
       const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, this.binding.runId)).for("update");
       const resultJson = record(run?.resultJson);
       const receipts = record(resultJson.apiToolReceipts);
-      receipts[key] = { digest, operationId: operation.operationId, state: "completed", result };
+      receipts[key] = { digest, operationId: operation.operationId, state: "completed", ...storedResult };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
     });
     return result;
@@ -904,6 +960,12 @@ export class PaperclipRunnerToolAuthority {
     if (file.artifactId) {
       const asset = await assetService(this.db).getById(file.artifactId);
       if (!asset || asset.companyId !== this.binding.companyId) throw forbidden("Artifact is not available in this company");
+      const assertArtifactAccess = async () => {
+        const current = await this.#boundContext();
+        if (!(await canActorReadAssetContent(this.db, { ...this.#privacyActor(current.run), keyScope: this.#apiScope(current) }, asset)))
+          throw forbidden("Artifact is not available to this actor");
+      };
+      await assertArtifactAccess();
       if (asset.byteSize > RUNNER_API_MAX_BYTES) throw badRequest("Artifact exceeds API transfer limit");
       const object = await (this.binding.storage ?? getStorageService()).getObject(this.binding.companyId, asset.objectKey);
       const chunks: Buffer[] = [];
@@ -916,6 +978,7 @@ export class PaperclipRunnerToolAuthority {
           chunks.push(bytes);
         }
       } finally { object.stream.destroy(); }
+      await assertArtifactAccess();
       return { bytes: Buffer.concat(chunks), filename: asset.originalFilename ?? "file", contentType: asset.contentType };
     }
     const resolved = await workspaceFileResourceService(this.db).prepareDownload(this.binding.issueId, { path: file.path!, workspace: "auto" });
@@ -1017,8 +1080,7 @@ export class PaperclipRunnerToolAuthority {
       return { interactionId: review.interaction.id, status: expectedStatus, deduplicated: true };
     }
     const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
-    const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId,
-      context.actor.adapterType, this.binding.runId, context.run.responsibleUserId);
+    const token = this.#apiToken(context);
     if (!apiUrl || !token) throw new Error("Review tool authentication is unavailable");
     // Use the existing resolution route so authorization, activity, dependency
     // wakes and request-changes continuation have one implementation.
@@ -1219,6 +1281,7 @@ export class PaperclipRunnerToolAuthority {
       const createInput = {
         id: issueId,
         projectId,
+        workspaceSelectionActor: this.#privacyActor(context.run),
         ...(trust.kind === "low_trust_review" ? {
           executionPolicy: { ...normalizeIssueExecutionPolicy({ authorizationPolicy: { trustPreset: trust.preset, trustBoundary: trust.boundary } }) },
           sourceTrust: buildLowTrustSourceTrust({ issueId, runId: this.binding.runId, agentId: this.binding.agentId }),
@@ -1275,7 +1338,7 @@ export class PaperclipRunnerToolAuthority {
           agentId: this.binding.agentId, runId: this.binding.runId, issueId: child.id,
           action: "issue.created", entityType: "issue", entityId: child.id,
           details: { identifier: child.identifier, title: child.title, parentId: child.parentId,
-            assigneeAgentId: child.assigneeAgentId, status: childStatus, source: "paperclip_runner_protocol" },
+            assigneeAgentId: child.assigneeAgentId, assigneeUserId: child.assigneeUserId, status: childStatus, source: "paperclip_runner_protocol" },
         });
         publication = activity.publication;
       }
@@ -1475,7 +1538,8 @@ export class PaperclipRunnerToolAuthority {
         agentId: this.binding.agentId, runId: this.binding.runId, issueId: taskId,
         action: "issue.reassigned", entityType: "issue", entityId: taskId,
         details: { source: "paperclip_runner_protocol", reassignmentKey: durableKey, inputFingerprint: fingerprint,
-          previousAssigneeAgentId: target.assigneeAgentId, assigneeAgentId, reason, changed, receipt },
+          previousAssigneeAgentId: target.assigneeAgentId, previousAssigneeUserId: target.assigneeUserId,
+          assigneeAgentId, assigneeUserId, reason, changed, receipt },
       });
       publication = activity.publication;
       return receipt;

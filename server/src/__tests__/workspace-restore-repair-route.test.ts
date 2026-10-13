@@ -5,7 +5,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agents, agentWakeupRequests, companies, createDb,
-  environmentLeases, heartbeatRuns, issueRecoveryActions, issues,
+  environmentLeases, heartbeatRuns, issueRecoveryActions, issues, chatConversations, chatEndpoints, toolApplications, toolConnections,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
@@ -92,6 +92,23 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     app.use(errorHandler);
     return { app, wake };
   }
+
+  it.each(["active", "unavailable", "endpoint_removed"])("keeps original file recovery instructions for a %s chat", async state => {
+    const f = await seed();
+    const endpointId = randomUUID();
+    const applicationId = randomUUID(), connectionId = randomUUID();
+    await db.insert(toolApplications).values({ id: applicationId, companyId: f.companyId, name: "Chat recovery", type: "chat" });
+    await db.insert(toolConnections).values({ id: connectionId, companyId: f.companyId, applicationId,
+      name: "Chat recovery", uid: randomUUID(), transport: "chat_sdk", connectionPurpose: "channel", status: "active", enabled: true });
+    await db.insert(chatEndpoints).values({ id: endpointId, companyId: f.companyId, connectionId,
+      provider: "slack", publicId: randomUUID(), assignedAgentId: f.currentAgentId, status: "active" });
+    await db.insert(chatConversations).values({ companyId: f.companyId, endpointId, issueId: f.issueId,
+      externalConversationId: randomUUID(), externalLabel: "Recovery conversation", state });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({
+      recoveryActionId: f.actionId, workspaceRepairRequired: true, canRecordWorkspaceRepair: true,
+      nextAction: "Repair the retained workspace before continuing.", canRetry: false, canContinue: false,
+    });
+  });
 
   async function assertSourceUnchanged(f: Awaited<ReturnType<typeof seed>>) {
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]).toEqual(f.issueBefore);

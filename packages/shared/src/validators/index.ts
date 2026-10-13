@@ -441,6 +441,7 @@ export {
   resolveIssueRecoveryActionSchema,
   isValidExistingBranchName,
   retryWorkspaceExportSchema,
+  resumeWorkspaceFinalizationSchema,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -996,3 +997,5 @@ export { restoreAgentInstructionSchema } from "./agent.js";
 
 export * from "./skill-source.js";
 export * from "./agent-commentary.js";
+export * from "./task-workspace.js";
+export * from "./workspace-repository.js";

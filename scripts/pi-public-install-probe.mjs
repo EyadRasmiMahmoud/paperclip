@@ -2,10 +2,42 @@
 // Run in a credential-free public npm consumer after `paperclipai runtime setup pi`.
 // Use the server's normal packaged daemon resolver; never submit a prompt.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export async function verifyPiPackagedDaemon(server, daemon, target, runnerBinaryTarget) {
+  assert.match(target, /^(?:linux|darwin)-(?:x64|arm64)$/);
+  const output = join(server, 'dist/vendor/paperclip-runner'), manifestPath = join(output, 'bin/release-manifest.json');
+  let manifest;
+  try { manifest = JSON.parse(await readFile(manifestPath, 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  let expectedPath = join(output, 'bin/paperclip-runnerd');
+  if (manifest !== undefined) {
+    assert.ok(manifest && typeof manifest === 'object' && !Array.isArray(manifest), 'Release manifest must be an object');
+    assert.equal(await realpath(manifestPath), manifestPath, 'Release manifest must remain inside the installed package');
+    assert.equal(manifest.schema, 'paperclip.runner.release-binaries.v1');
+    assert.match(manifest.sourceRevision, /^[a-f0-9]{40}$/);
+    const build = JSON.parse(await readFile(join(server, 'dist/build-info.json'), 'utf8'));
+    assert.equal(manifest.sourceRevision, build.commit, 'Packaged daemon source must match the installed server build');
+    const artifact = manifest.platforms?.[target];
+    assert.equal(artifact?.path, `${target}/paperclip-runnerd`, 'Packaged daemon must use the known host target path');
+    assert.match(artifact.sha256, /^sha256:[a-f0-9]{64}$/);
+    expectedPath = join(output, 'bin', artifact.path);
+    assert.equal(await realpath(daemon), expectedPath, 'Production must select the installed host daemon');
+    assert.equal(await realpath(expectedPath), expectedPath, 'Packaged daemon cannot escape through a symlink');
+    const bytes = await readFile(expectedPath);
+    assert.equal(`sha256:${createHash('sha256').update(bytes).digest('hex')}`, artifact.sha256);
+    assert.equal(runnerBinaryTarget(bytes), target);
+  } else {
+    assert.equal(await realpath(daemon), expectedPath);
+    assert.equal(runnerBinaryTarget(await readFile(expectedPath)), target);
+  }
+}
+
+async function main() {
 
 const [serverDirectory, ...extra] = process.argv.slice(2);
 assert.ok(serverDirectory && extra.length === 0, 'Usage: pi-public-install-probe.mjs INSTALLED_SERVER_ROOT');
@@ -25,7 +57,8 @@ assert.equal(QUALIFIED_ACPX_PROFILES.pi.commandDigest, 'sha256:e92078bee3c23bec4
 assert.equal(Object.hasOwn(QUALIFIED_ACPX_PROFILES.pi, 'qualificationModel'), false);
 assert.equal(Object.hasOwn(QUALIFIED_ACPX_PROFILES.pi, 'reportedModelId'), false);
 const daemon = resolvePaperclipRunnerBinary();
-assert.equal(await realpath(daemon), join(server, 'dist/vendor/paperclip-runner/bin/paperclip-runnerd'));
+const { runnerBinaryTarget } = await import(pathToFileURL(join(server, 'dist/vendor/paperclip-runner/live/runner-binary.js')));
+await verifyPiPackagedDaemon(server, daemon, `${process.platform}-${process.arch}`, runnerBinaryTarget);
 const root = await mkdtemp(join(tmpdir(), 'pi-public-install-probe-'));
 const evidence = [];
 const started = performance.now();
@@ -69,3 +102,5 @@ try {
   try { await bundle?.transport.close(); }
   finally { clearTimeout(watchdog); await rm(root, { recursive: true, force: true }); }
 }
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

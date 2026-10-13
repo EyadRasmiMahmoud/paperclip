@@ -340,6 +340,8 @@ Notes:
 ## General Notes
 
 - The `docker-entrypoint.sh` adjusts the container `node` user UID/GID at startup to match the values passed via `USER_UID`/`USER_GID`, avoiding permission issues on bind-mounted volumes.
+- Before it drops privileges, the entrypoint makes sure `PAPERCLIP_HOME` is owned by the `node` user. Each boot checks only the home directory and its first three levels. The first boot (and any boot after a UID/GID change) also checks the full tree, and then writes `PAPERCLIP_HOME/.paperclip-ownership-verified`. While that marker is current, later boots skip the full-tree walk, which can take minutes on homes with many files. A mismatch triggers a recursive `chown`. If files deep in the tree get the wrong owner (for example, after a restore as root), delete the marker and restart to force a full check. If a check fails (for example, with an I/O error), the entrypoint does not write the marker, so the next boot checks again.
+- The entrypoint writes timestamped lines when it starts, around the full ownership check or any repair (with the duration), and just before it starts the server, so you can measure the pre-start time from the container log.
 - Paperclip data persists via Docker volumes/bind mounts (compose) or at `~/.local/share/paperclip` (quadlet).
 
 ## Native Runner build cache

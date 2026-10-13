@@ -1,3 +1,4 @@
+import { runTaskWorkspacesFlow } from "./task-workspaces-flow.js";
 import type { RestartRunnerIdentity } from "./process-tree-owner.js";
 import { runNativeActiveStopFlow } from "./native-active-stop-flow.js";
 import { runPiControlsFlow } from "./pi-controls-flow.js";
@@ -30,6 +31,7 @@ import { runContinuationFlow } from "./continuation-flow.js";
 import { runEverydayFlow } from "./everyday-flow.js";
 import { gradeTaskTitle } from "./task-titles.js";
 import { runContextIntegrityFlow } from "./context-integrity-flow.js";
+import { runRepositorySkillsFlow } from "./repository-skills.js";
 import { captureStockHarness, gradeStockHarness, gradeStockHire } from "./stock-harness.js";
 import { verifyStockHarnessPreflight, STOCK_PREFLIGHT_ENV } from "./stock-harness-admission.js";
 import { createTaskThroughUi, submitTaskReply } from "./user-actions.js";
@@ -50,7 +52,7 @@ import { runnerExecutionById } from "./catalog.js";
 import { classifyFailure } from "./failure-classifier.js";
 import { runnerE2EServerControlPaths } from "./harness-env.js";
 import { setupConnectionReview } from "./connection-reviews.js";
-import { setupLiveFixtures, type LiveFixtureValues } from "./live-fixtures.js";
+import { setupLiveFixtures, selectFixtureRuntimeLeases, type LiveFixtureValues } from "./live-fixtures.js";
 import { evaluateMatcher, persistedFinalRunMessage, type MatcherResult } from "./matchers.js";
 import { readRegisteredArtifacts } from "./registered-artifact.js";
 import {
@@ -590,7 +592,7 @@ for (const execution of executions) {
     const credentials = credentialValues();
     const secrets = normalizedSecrets(Object.values(credentials));
     const api = new RunnerApi(request);
-    const companyRunFlow = execution.suite.id === "task-titles" || ["plan_task_guidance", "blocker_guidance", "continuation_accounting", "continuation", "context_integrity", "agent_chat", "everyday_workflow", "first_task", "instruction_persistence", "pi_native", "pi_controls", "copilot_protection", "cursor_native", "native_active_stop", "native_provider_loss", "public_mcp"].includes(execution.task.flow);
+    const companyRunFlow = execution.suite.id === "task-titles" || ["plan_task_guidance", "blocker_guidance", "continuation_accounting", "continuation", "context_integrity", "repository_skills", "agent_chat", "everyday_workflow", "first_task", "instruction_persistence", "pi_native", "pi_controls", "copilot_protection", "cursor_native", "native_active_stop", "native_provider_loss", "public_mcp"].includes(execution.task.flow);
     const publicMcpUsage = execution.task.flow === "public_mcp" ? assistantUsage(execution.profile.provider === "claude" ? "anthropic" : "openai", execution.profile.model) : undefined;
     let publicMcpUserId = "";
     const consoleDiagnostics: Array<Record<string, unknown>> = [];
@@ -694,16 +696,9 @@ for (const execution of executions) {
       const listed = await api.get<EnvironmentLeaseRecord[]>(
         `/api/environments/${fixtures.environment.id}/leases`,
       );
-      const selectedRunIds = new Set(selectedRuns.map((run) => run.id));
-      const relevant = listed.filter(
-        (lease) =>
-          lease.provider === "daytona" &&
-          (selectedRunIds.size === 0 ||
-            (lease.heartbeatRunId &&
-              selectedRunIds.has(lease.heartbeatRunId)) ||
-            (issue && lease.issueId === issue.id)),
-      );
-      runtimeLeases = relevant.length > 0 ? relevant : listed;
+      runtimeLeases = selectFixtureRuntimeLeases({ leases: listed,
+        runIds: selectedRuns.map(run => run.id), issueId: issue?.id,
+        setupProbeLeaseId: fixtures.setupProbe?.leaseId });
     };
 
     const cancelActiveRunsForCleanup = async () => {
@@ -966,6 +961,8 @@ for (const execution of executions) {
           companyId: fixtures.company.id,
           environmentId: fixtures.environment.id,
           agentId: fixtures.agent.id,
+          ...(fixtures.setupProbe ? { setupProbe: { durationMs: fixtures.setupProbe.durationMs,
+            ...(fixtures.setupProbe.defaultRunner ? { defaultRunner: fixtures.setupProbe.defaultRunner } : {}) } } : {}),
           secretIds: Object.fromEntries(
             Object.entries(fixtures.secretRefs).map(([name, ref]) => [
               name,
@@ -982,7 +979,17 @@ for (const execution of executions) {
         secrets,
       );
 
-      if (execution.task.flow === "public_mcp") {
+      if (execution.task.flow === "task_workspaces") {
+        const journey = await runTaskWorkspacesFlow({ page, api, fixtures, execution, nonce, temporaryRoot,
+          deadlineAt: startedAtMs + deadlineMs - 30_000,
+          restart: () => restartIsolatedPaperclipServer({ api, requestId: `task-workspaces-${nonce}`, deadlineAt: startedAtMs + deadlineMs }),
+          observe: (currentIssue, currentRuns, checks) => {
+            issue = currentIssue as IssueRecord; selectedRuns = currentRuns as RunRecord[];
+            matcherResults = checks.map(check => ({ matcher: { kind: "json_path" as const, path: `taskWorkspaces.${check.id}`, expected: true }, passed: check.passed, detail: check.detail }));
+          }, capture: captureScreenshot, evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, secrets),
+        });
+        issue = journey.issue as IssueRecord; selectedRuns = journey.runs as RunRecord[];
+      } else if (execution.task.flow === "public_mcp") {
         const journey = await runPublicMcpFlow({
           page, api, fixtures, execution, nonce, secrets, userId: publicMcpUserId,
           credential: credentials[execution.profile.credential]!, usage: publicMcpUsage!, deadlineAt: startedAtMs + deadlineMs,
@@ -1115,6 +1122,14 @@ for (const execution of executions) {
         });
         issue = story.issue; selectedRuns = story.runs;
         matcherResults = story.evidence.checks.map(check => ({ matcher: { kind: "json_path" as const, path: check.id, expected: true }, passed: check.passed, detail: check.detail }));
+      } else if (execution.task.flow === "repository_skills") {
+        const story = await runRepositorySkillsFlow({ page, api, fixtures, execution, nonce, credentials, secrets,
+          deadlineAt: startedAtMs + deadlineMs, capture: captureScreenshot,
+          evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, secrets),
+          observe: (currentIssue, currentRuns) => { issue = currentIssue as IssueRecord; selectedRuns = currentRuns as RunRecord[]; },
+        });
+        issue = story.issue as IssueRecord; selectedRuns = story.runs as RunRecord[];
+        matcherResults = story.checks.map(check => ({ matcher: { kind: "json_path" as const, path: `repositorySkills.${check.id}`, expected: true }, passed: check.passed, detail: check.id }));
       } else if (execution.task.flow === "context_integrity") {
         const contextIntegrity = await runContextIntegrityFlow({
           page, api, fixtures, execution, nonce, deadlineAt: startedAtMs + deadlineMs,
@@ -2322,7 +2337,7 @@ for (const execution of executions) {
       if (registeredArtifacts.length > 0) {
         await writeSanitizedJson(snapshotsDir, "downloaded-registered-artifacts.json", registeredArtifacts, secrets);
       }
-      matcherResults = await Promise.all(
+      matcherResults.push(...await Promise.all(
         taskMatchers.map((matcher) =>
           evaluateMatcher(matcher, {
             ...matcherObservation,
@@ -2336,7 +2351,7 @@ for (const execution of executions) {
               matcher.kind === "message_exact" ? finalRunMessage : message,
           }),
         ),
-      );
+      ));
       const failedMatchers = matcherResults.filter((result) => !result.passed);
       const exactMessageMatcher = taskMatchers.find(
         (matcher) => matcher.kind === "message_exact",

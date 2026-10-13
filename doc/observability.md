@@ -161,17 +161,46 @@ This document also holds three local instrumentation contracts: native runner
 traces, sandbox startup traces, and sandbox duplex transport instrumentation.
 Those sections follow below.
 
+## Controller preparation phases
+
+With an operator OTLP endpoint, `paperclip.heartbeat-preparation` emits active
+`heartbeat.prepare.<phase>` spans around environment selection, execution
+configuration, session preparation, workspace preparation, GitHub environment
+and launcher preparation, run output initialization, workspace validation,
+runtime services, instruction files, and runtime selection. Database and HTTP
+instrumentation can attach child spans during each awaited operation.
+
+Each phase starts a new root trace and links to the active trigger span when
+one exists. An unsampled HTTP request must not suppress diagnostics for the
+background run it starts. Root traces still follow the operator's configured
+sampler. The trigger's trace remains unchanged, and overlapping runs keep
+their own phase and child contexts.
+
+These spans exist before provider dispatch, including setup failures. Each has
+only the existing `paperclip.task.run.run_id` attribute: the first 12 hexadecimal
+characters of the run UUID's SHA-256 hash. Failed operations set error status
+without recording exception messages, paths, inputs, or returned content.
+Search by that hash without a root-name filter to include these preparation
+traces; the provider lifecycle trace is created later and can have a different
+trace ID. Without an endpoint, tracing remains a no-op. These spans add no
+first-party Telemetry events or database run-log writes.
+
 ## Native Runner Trace Spans
 
 Paperclip Runner task runs emit a single foldable OpenTelemetry trace. This is
-the native-run trace schema version `2`. `task.run` is the only full-run root;
+the native-run trace schema version `3`. `task.provider_session` is the native
+provider lifecycle root; it includes preparation and provider execution, but
+ends before outer workspace persistence. The heartbeat-owned local run-log
+`task.run.measured` records terminal elapsed time including durable copyback;
 every other native span carries a real OpenTelemetry parent context rather than
 only a descriptive `parentName` field.
+
+The run link in Honeycomb matches both `task.provider_session` for native runs and `task.run` for legacy adapters. It retains the exact hashed run-ID and service filters and groups by trace ID. The URL builder uses Honeycomb’s supported `in` operator for the two root names; see the [query specification](https://github.com/honeycombio/honeycomb-mcp#query-specification-for-run_query). This changes only the query link. The operator endpoint gate and span attribute allowlist remain unchanged.
 
 The canonical lifecycle is:
 
 ```text
-task.run
+task.provider_session
 ├── heartbeat.queue
 ├── task.prepare
 │   ├── environment.startup
@@ -253,10 +282,11 @@ and outcome. Native child attributes use the bounded
 `paperclip.native.span.` prefix and a closed key allowlist; values are limited
 to finite numbers, booleans, or short strings. Commands, arguments, environment
 values, paths, output, credentials, and raw identifiers are discarded by the
-trace helper. `task.run.measured` remains in the local run log for compatibility
-but is not exported as a second full-width OTel span.
+trace helper. `task.provider_session.measured` records that same interval in the
+local run log, without a duplicate full-width OTel span. The separate heartbeat
+`task.run.measured` event is the authoritative end-to-end duration.
 Persisted `run.performance.span` events retain the v1 run-log schema and include
-`traceSchemaVersion: 2` so local tooling can distinguish the hierarchy.
+`traceSchemaVersion: 3` so local tooling can distinguish the hierarchy.
 
 Like every span in this document, native-run spans are opt-in. When
 `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, the tracer remains a no-op; the local
@@ -595,6 +625,16 @@ still describes the earlier failure. The overall error message is unchanged.
 Elapsed time is bounded to seven days, and the budget to one day. Unknown or
 malformed optional values are omitted without invalidating cleanup ownership.
 
+When the deadline expires while Daytona creation is still pending, the plugin
+makes one read-only lookup (bounded to five seconds, inside the host's 30-second
+RPC margin) of its provisional creation name and reports
+`environmentAcquisitionProviderState`. The value is one of `absent`, `creating`,
+`pending_build`, `building_snapshot`, `pulling_snapshot`, `starting`, `started`,
+`error`, `build_failed`, `other`, or `unavailable` (lookup failed, timed out, or
+ownership labels did not match). It records where the provider left the
+allocation, not why. The lookup does not delete, retry, or change the cleanup
+envelope.
+
 These fields cross the existing creation-cleanup RPC envelope only for lease
 acquisition. The host accepts them only from an actual RPC error with matching
 company, environment, and run ownership. A private receipt binds the report to
@@ -628,6 +668,17 @@ pending. Recent events do not prove useful progress. These fields contain only
 numbers and a boolean, never tool names, IDs, arguments, or event content, and
 do not change the execution timeout, cancellation, or recovery policy.
 
+A stopped turn (wall-clock timeout or operator stop) also records
+`acpLastEventAgeAtStopMs` and `acpOldestPendingToolAgeAtStopMs`, measured at the
+moment the stop fired. A cancel can make the agent emit closing events, so the
+finalization age alone cannot separate a turn that went silent long before its
+deadline from one that was still working. For a stopped turn, pending tools
+means the tools pending when the stop fired, so a tool the cancel closes still
+counts; `acpPendingToolCount` keeps its finalization-time meaning. When tools are
+pending, `acpPendingToolKinds` lists their ACP tool kinds as a sorted, comma-separated
+string drawn only from the closed ACP `ToolKind` enum plus `unknown`; the
+server drops the field if any other value appears.
+
 ACP and legacy OpenCode results retain the adapter's resolved wall-clock timeout as
 `adapterExecutionTimeout` in the instance run result. Finalization uses it for
 `effectiveTimeoutSec`, `timeoutSource`, and `timeoutConfigured`. Sources are
@@ -642,6 +693,19 @@ resolved policy describes the configured limit, not proof that its timer fired;
 `timeoutFired` retains the existing terminal timeout classification. Provider
 stderr remains in the instance run log and is not used as the timeout exception
 message. An earlier provider timeout does not establish its upstream cause.
+
+Legacy OpenCode requests Daytona's persistent process session for
+its main CLI command. Daytona targets with the effective persistent-session capability
+use asynchronous dispatch and log observation instead of holding one synchronous
+command HTTP request open for the whole run. The command's resolved timeout is
+forwarded separately from individual status/log observation timeouts. One timer
+bounds dispatch and observation, fences late log callbacks, and clears at settlement.
+A timeout does not prove command termination; the existing stop/lease cleanup
+path still owns that evidence. Existing session callers without this deadline
+keep their previous lifetime. Probes, preparation and other providers
+keep their existing paths. Local and SSH execution do not use this option.
+The resolved execution budget and lease cleanup remain unchanged; the session
+request does not prove that a previously observed gateway timeout had this cause.
 
 When settlement records a workspace restore failure, `run_execution` also
 includes `workspaceRestoreFailure` with one of the shared, path-free codes:
@@ -1020,16 +1084,16 @@ spans. A run-time
 (`sandbox.agentSession.sendInput`, `sandbox.agentSession.pollOutput`,
 `sandbox.callbackBridge.relayRequest`, or `sandbox.agentProcess`). Each run-time
 wrapper span parents to the live run span (`agent.turn` during the turn,
-`task.run` otherwise). With no active trace context the exec span opens
+`task.provider_session` otherwise). With no active trace context the exec span opens
 unparented.
 
 `sandbox.agentProcess` wraps the persistent streamed agent process. The
 process-session bridge launches it during `bridge.process-session`, so it opens
-under `task.run` — no turn has started yet. It therefore overlaps the sibling
+under `task.provider_session` — no turn has started yet. It therefore overlaps the sibling
 `agent.turn` rather than nesting under it or dangling off the short-lived bring-up
 step. The span ends when the process settles or when the bridge tears down,
 whichever comes first. The bridge tears down before the run root span ends, so
-the span never outlives `task.run` even when the process lingers past teardown
+the span never outlives `task.provider_session` even when the process lingers past teardown
 (the sandbox `execute` has no cancel, so a lingering process cannot be forced to
 resolve).
 

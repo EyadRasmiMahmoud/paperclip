@@ -15,7 +15,8 @@ Company members and agents cannot read this report.
    300 seconds. Save the returned `ownerId` and `expiresAt`. An existing drain
    returns 409. An unsupported purpose must leave automatic sleep disabled.
 3. Poll the report with that exact owner. Only
-   `{ "version": 1, "backgroundWork": "none" }` permits sleep. Require the same
+   `{ "version": 1, "backgroundWork": "none" }` permits ordinary idle sleep. The
+   optional routine protocol below requires a durable host alarm as well. Require the same
    `ownerId`, `draining: true`, zero run/wake counters, and enough remaining TTL
    for the provider stop. `present`, `unknown`, missing fields, or errors must
    keep the instance awake. Do not interpret `quiescent` alone as authorization.
@@ -34,6 +35,70 @@ Health and control mutations remain tracked through completion, including
 signed bootstrap writes. Only the task-drain read skips request tracking.
 Its authentication finishes under a separate work token before entering the
 report, so it counts concurrent writes without blocking on its own scan.
+
+## Scheduled routine wake protocol
+
+Verified signed Cloud control callers may opt into
+`GET /api/instance/task-drain?idleSleepSafety=1&scheduledWake=1&ownerId=<owner>`.
+Tenant tokens, browser instance administrators, local implicit actors, and agents
+cannot request this extension. Ordinary reports retain their existing behavior.
+
+If all other background-work checks pass, active routines may return
+`idleSleepSafety: { version: 2, backgroundWork: "none", scheduledWake }`.
+The proof has `version: 1`, `kind: "routines"`, a SHA-256 `generation`, and the
+earliest `nextWakeAt` across every company. Only enabled, unarchived schedule
+triggers with valid cron, timezone and future `next_run_at` qualify. Unsupported
+triggers, setup work, due work, unknown states and more than 10,000 active
+triggers keep the instance awake. Inactive triggers do not create obligations.
+Active routines without enabled triggers have no timed work. Definitions are
+read in the same repeatable-read transaction as the other durable checks.
+
+The host must commit one durable alarm for the exact stack under its live sleep
+lease before stopping compute. It must then re-read the same owned report and
+require the exact generation and deadline. Generation binds the process, hold
+owner and routine/trigger catalog, so restart or schedule edits invalidate it.
+No routine definitions or tenant identifiers appear in the proof. Failure to
+persist or validate the alarm abandons sleep. Cloud acknowledges persistence
+inside its controller; this report alone never authorizes scheduled sleep.
+
+Cloud must start waking early enough for measured startup latency and retry
+failed or missed wakes across controller restart. After wake, the existing
+routine scheduler owns execution, atomic claims and catch-up rules. Local
+scheduling is unchanged for self-hosted instances and whenever Cloud declines
+sleep. This first extension covers routines only. Agent timers, plugin jobs,
+retries, integrations and unsupported queues retain their existing blockers.
+All mutations must enter through the host admission/wake path. Independent
+database writers are outside this single-process protocol.
+
+Verify a full scheduled sleep/wake/execution cycle on staging before enabling
+this host capability. The [tests](../server/src/__tests__/idle-sleep-safety.test.ts)
+cover ownership, future deadlines, changed generations and conservative fallback.
+
+## Retry history
+
+Retry promotion keeps `scheduled_retry_at` on a run for inspection. That date
+is consumed history when the run is terminal, has a finish time at or after the
+retry date, and has no accounting work pending. The idle report uses the same
+proof for failed ephemeral leases, coalesced wakes, and acknowledged question
+responses. A live retry child still blocks through the instance-wide run check.
+Unfinished runs, retry dates after the finish time, and pending accounting stay
+awake. The inspection does not clear dates or change retry scheduling.
+
+## Retained local workspaces
+
+Local directories for primary projects and Git worktrees do not require an
+awake process by themselves. The report permits their retained rows only in
+known modes and states, with no runtime configuration, service state, commands,
+pending reopen, or cleanup already eligible. Saved environment references alone
+are passive. Shared workspaces with a project workspace remain blockers because
+they can inherit runtime configuration. Unfamiliar providers, strategies,
+configuration and malformed metadata also remain blockers.
+
+This does not delete files, alter retention, or clear workspace records. Future
+cleanup eligibility is an earliest allowed time; eligible cleanup can wait for
+the next wake. Due cleanup, unfinished operations, runtime leases and runtime
+services still keep the instance awake through their separate checks. The host
+must keep workspace storage attached across sleep and preserve its backup policy.
 
 ## Accepted work and cleanup
 
@@ -113,17 +178,36 @@ operator reconciliation; this API does not discard it to save compute.
 
 The report checks all companies in one bounded read-only database transaction.
 Queued and orphaned runs, timers, retries, accounting debt, unfinished issues,
-cleanup, active routines, integrations, external API credentials, and plugin
+cleanup, active routines, integrations, external ingress credentials, and plugin
 work block sleep. Completed ordinary run history does not. Less common work
 sources conservatively block on any retained records. Active issue watchdogs
 block sleep even when their watched issue is complete and no review has started.
 Missing migrations, malformed configuration and database errors produce unknown
 without exposing SQL or tenant data.
 
+Active `runtime_auth` connections with purpose `ai` are saved credentials, not
+independent workers. Their saved configuration does not block sleep. Login
+sessions and runs still pass the existing durable checks. Detached subscription
+observations and quota reads remain counted through their actual completion,
+including token refresh after a quota response times out. Credential-recovery
+journals, partial writes and probes block sleep across restart. Empty company
+directories left after successful recovery do not; invalid paths and read
+failures remain unknown. Credentials and connection records are retained.
+MCP, chat and other connections still block until they have a wake contract.
+
+A failed ephemeral lease is history only with successful cleanup, a release
+timestamp, and an exact provider termination receipt bound to its company, run,
+lease and resource. Its run must be finished without retry or accounting debt.
+Pending cleanup claims and export/stop-and-retain intents still block. Failure
+labels or cleanup success without that proof do not authorize sleep. Lease
+history is retained; this check performs no provider teardown or data updates.
+
 Finished login-session history permits sleep only after its promotion claim is
-cleared and any retained provider reference has a matching released or expired
-lease with successful cleanup and a release timestamp in the same company and
-environment. Missing cleanup evidence, `cleanup_pending`, and live login flows
+cleared and any retained provider reference has a matching released, expired,
+or verified failed ephemeral lease with successful cleanup and a release
+timestamp in the same company and environment. The failed lease must satisfy
+the same termination and run checks above. Missing cleanup evidence,
+`cleanup_pending`, and live login flows
 remain blockers. A finished coalesced wake is history only when its exact
 company/agent's linked run has finished without retry or accounting debt.
 Image-setup history still blocks: promotion can succeed before teardown is

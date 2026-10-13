@@ -2177,3 +2177,80 @@ Private traces and database files must not be published. Unconfirmed cleanup
 always preserves recovery state regardless of this optional diagnostic flag.
 
 The `file-edit-validate` fixture independently downloads the exact active artifact work product from the tested run. It requires the matching run-attributed attachment, filename, MIME type, recorded byte count and SHA-256, then compares the downloaded content to the expected bytes. A workspace file alone cannot satisfy this gate. Explicit failed-case diagnostic retention follows the final result after integrity, isolation and evidence checks, including incomplete publication.
+
+## Projectless task workspaces (explicit-only)
+
+`task-workspaces` contains exactly three cells: legacy OpenCode locally and native
+OpenCode locally and on Daytona, using the existing qualified model. These are
+configured acceptance cells; registration and fixture calibration do not establish
+live qualification.
+
+```sh
+pnpm test:e2e:runner -- --list --suite task-workspaces
+pnpm test:e2e:runner -- --id task-workspaces.legacy-opencode.local.task-directory-repository-resume --max-automatic-retries 0
+pnpm test:e2e:runner -- --id task-workspaces.runner-opencode.local.task-directory-repository-resume --max-automatic-retries 0
+pnpm test:e2e:runner -- --id task-workspaces.runner-opencode.daytona.task-directory-repository-resume --max-automatic-retries 0
+```
+
+Each cell creates a task through the browser without a project or configured
+adapter cwd. The first turn writes task files and requests the same public
+repository preparation twice. Independent APIs must show one pending receipt
+and the same original root. After a controller restart, the second admission
+prepares the repository; the agent makes a local commit and leaves a dirty file.
+The third turn copies those prior bytes into a registered downloadable artifact.
+The oracle checks the task's exact root and stable binding, public file reads,
+repository pin, local Git ancestry and dirty bytes, artifact metadata/digest,
+three attributed successful runs, durable native terminal events and remote
+lease attribution. Daytona uses per-turn leases, so a warm process cannot stand
+in for persisted files. This suite does not qualify channel-default configuration
+or arbitrary repository credentials.
+
+These cells exercise trusted app-created tasks. Low-trust chat tasks cannot use
+`prepare_repository` to initiate controller clones, even for public URLs with
+full-auto provider permissions. Their pending acquisitions fail after a trust
+downgrade; verified existing public checkouts can be reused without acquisition.
+No-repository admission and immutable recovery remain supported. Trusted
+acquisition does not yet impose repository byte or cumulative storage quotas.
+
+Each cell allows three turns, one attempt, four minutes per turn and fifteen
+minutes total, with 1,000-cent company and agent budget hard stops. `--all` excludes
+it. `OPENROUTER_API_KEY` is required; Daytona also requires `DAYTONA_API_KEY`, a
+verified immutable image and its matching remote runner/provider artifacts.
+Use the normal isolated-instance cleanup and report pipeline. Private evidence
+includes `snapshots/task-workspaces.json` and `task-workspaces-runs.json`; only
+marked synthetic task screenshots can enter the public projection.
+
+## Repository skill packages
+
+The explicit `repository-skills` suite imports the private
+`paperclipai/poteto-stack` repository through the production GitHub Sources UI,
+selects `architect` and `bro` in repository mode, and assigns those imported
+skills to a production-default Codex agent. It disables the source connection
+before creating the task through the browser. No fixture copies the repository
+into an agent workspace.
+
+Set `GITHUB_TOKEN` with read access to that repository, `OPENAI_API_KEY`, and,
+for Daytona, `DAYTONA_API_KEY` and the immutable `PAPERCLIP_E2E_DAYTONA_IMAGE`.
+On macOS, also set `PAPERCLIP_RUNNER_REMOTE_BINARY_PATH` to the verified Linux
+runner from that pinned image, as described above.
+Credentials follow the existing encrypted company-secret and redaction paths.
+These tests send the selected private skill instructions to OpenAI and deliver
+the package to the selected runtime.
+
+```sh
+pnpm test:e2e:runner -- --id repository-skills.runner-codex.local.poteto-package
+pnpm test:e2e:runner -- --id repository-skills.runner-codex.daytona.poteto-package
+```
+
+Each case has one provider run and no automatic retries. While the agent pauses
+after reading its two installed skills and publishing their runtime locations
+in a run-attributed progress comment,
+the test independently reads both delivered directories. On Daytona it uses the
+SDK only to inspect the exact active sandbox lease owned by this test's company,
+agent, issue and run. Paths must belong to that native session's provider home
+or its immutable context bundles. Local prepared assets must be explicitly
+listed for the selected skills in the active session's digest-validated runtime
+context; an arbitrary cache directory does not qualify. Git blob hashes, sizes and executable bits must match every
+tracked file in the imported commit, including sibling skills, shared agents,
+binary assets and upstream credits. Both distinct discovery wrappers must point
+to their canonical entrypoints. The task must finish successfully in the UI.

@@ -1,3 +1,4 @@
+import { TASK_WORKSPACES_SUITE, taskWorkspaceTask, taskWorkspaceProfile, taskWorkspaceDefinitionDigest } from "./task-workspaces-cases.js";
 import { nativeActiveStopTasks } from "./native-active-stop-tasks.js";
 import { piControlTasks } from "./pi-controls-cases.js";
 import { cursorNativeTasks } from "./cursor-native-cases.js";
@@ -39,6 +40,7 @@ import { QUALIFIED_ACPX_PROFILES } from "../../packages/paperclip-runner/src/dri
 import { ACPX_QUALIFICATION_MODELS } from "../acpx-qualification-models.js";
 import { QUALIFIED_OPENCODE_MODEL } from "../../packages/paperclip-runner/src/drivers/opencode/opencode-server-driver.js";
 import { CREDENTIAL_NAMES } from "./types.js";
+import { repositorySkillsTask, repositorySkillsProfile } from "./repository-skills.js";
 import { createGitStreamingTask } from "./daytona-git-streaming.js";
 import { PENDING_PROFILE_PREREQUISITES } from "./prerequisites.js";
 import {
@@ -1104,6 +1106,16 @@ export const extendedHarnessFileTask: RunnerTaskFixture = {
 
 export const runnerSuites: readonly RunnerSuiteFixture[] = [
   {
+    id: TASK_WORKSPACES_SUITE, label: "Task workspaces without projects", manualOnly: true,
+    description: "Three browser-driven admissions prove deferred repository preparation, stable projectless task files and nested Git persistence across a controller restart.",
+    groups: [], profiles: runnerProfiles.filter(profile => ["legacy-opencode", "runner-opencode"].includes(profile.id)).map(taskWorkspaceProfile),
+    environments: runnerEnvironments, tasks: [taskWorkspaceTask],
+    excludedExecutionIds: ["task-workspaces.legacy-opencode.daytona.task-directory-repository-resume"],
+    expectedMatrixSize: 3,
+    definitionMetadata: { version: 1, definitionDigest: taskWorkspaceDefinitionDigest(), scheduling: "explicit-only", providerTurns: 3,
+      attempts: 1, budgetMonthlyCents: 1000, project: "none", cwd: "unconfigured-task-default", oracle: "public-file-download-and-host-nested-git", remoteLifecycle: "per_turn" },
+  },
+  {
     id: "pi-controls", label: "Pi active controls", manualOnly: true,
     description: "Pending native-write Stop and browser-originated same-turn steering, with exact control receipts and independent retirement/no-effect evidence.",
     groups: ["native"], profiles: extendedHarnessProfiles.filter(profile => profile.qualificationCandidate === "pi"),
@@ -1604,6 +1616,15 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     definitionMetadata: { version: 8, instructions: "fixed-external", nativeIdleTimeoutMs: 1_200_000, autoStopIntervalMinutes: 25, generatedFileCount: 60_000, filenameBytes: 39_828_890, scheduling: "explicit-only", finalization: "committed-without-active-sync-or-retry", copyback: "all-generated-file-contents-change-each-turn" },
   },
   buildConnectionSuite(runnerProfiles, runnerEnvironments),
+  {
+    id: "repository-skills", label: "Repository skill packages", manualOnly: true,
+    description: "Live private Poteto import and byte-for-byte delivery to local and Daytona agent runtimes.",
+    groups: ["native"],
+    profiles: runnerProfiles.filter(profile => profile.id === "runner-codex").map(repositorySkillsProfile),
+    environments: [localEnvironment, daytonaWarmEnvironment], tasks: [repositorySkillsTask], expectedMatrixSize: 2,
+    definitionMetadata: { version: 1, scheduling: "explicit-only", maximumAttemptsPerCell: 1,
+      source: "paperclipai/poteto-stack", skills: ["architect", "bro"], grading: "independent-git-blob-hashes-and-file-modes-from-owned-runtime", budgetMonthlyCents: 1000 },
+  },
 ] as const;
 
 export function suiteDefinitionHash(suite: RunnerSuiteFixture) {
@@ -1625,6 +1646,7 @@ export function suiteDefinitionHash(suite: RunnerSuiteFixture) {
           id: task.id,
           flow: task.flow,
           expectedRunCount: task.expectedRunCount,
+          ...(task.requiredCredentials ? { requiredCredentials: task.requiredCredentials } : {}),
           ...(task.minimumExpectedRunCount === undefined ? {} : { minimumExpectedRunCount: task.minimumExpectedRunCount }),
           restartServerBeforeQuestionAnswer:
             task.restartServerBeforeQuestionAnswer ?? false,
@@ -1667,6 +1689,7 @@ export function buildRunnerMatrix(
               requiredCredentials: [
                 ...(task.flow === "provider_connection" ? [] : [profile.credential]),
                 ...(task.flow !== "provider_connection" && environment.credential ? [environment.credential] : []),
+                ...(task.requiredCredentials ?? []),
               ],
             }))
             .filter((execution) => !excludedExecutionIds.has(execution.id)),
@@ -1715,6 +1738,7 @@ export function validateRunnerCatalog(): MatrixExecution[] {
   const connectionSuite = runnerSuites.find(suite => suite.id === "provider-connections")!;
   const allProfiles = [...connectionSuite.profiles, ...extendedHarnessProfiles, ...runnerProfiles, ...legacyAcpxProfiles, ...pendingContextIntegrityProfiles, ...openRouterBreadthProfiles, ...everydayProfiles.filter(p => !runnerProfiles.some(existing => existing.id === p.id))];
   const allTasks = [
+    repositorySkillsTask,
     ...piNativeTasks,
     ...copilotProtectionTasks,
     ...connectionSuite.tasks,

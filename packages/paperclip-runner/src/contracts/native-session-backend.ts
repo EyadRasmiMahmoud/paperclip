@@ -40,6 +40,7 @@ export interface OpenNativeSessionInput {
 }
 
 export interface NativeSessionRecoveryOptions {
+  normalizeReplayPayload?(payload: PrpEvent["payload"]): PrpEvent["payload"];
   /** Abort provider recovery and release any not-yet-returned provider state. */
   signal: AbortSignal;
 }

@@ -39,6 +39,7 @@ import type {
 } from "../drivers/codex/app-server-transport.js";
 import { createSanitizedCodexEnvironment } from "../drivers/codex/app-server-transport.js";
 import {
+  CodexAppServerDriver,
   codexSemanticToolSpecs,
   createIsolatedCodexAppServerArgs,
 } from "../drivers/codex/codex-app-server-driver.js";
@@ -50,6 +51,7 @@ import type { NativeRunIdentity, NativeTurnControlCapabilities } from "../contra
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import type {
+  HarnessSession,
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
 } from "../contracts/harness-driver.js";
@@ -1333,6 +1335,7 @@ export interface CapabilityRunnerdCodexTransportOptions {
   controlPlaneRegistration?: (
     authority: DurablePrpControlPlane,
     identity?: DurableRecoveryIdentity,
+    signal?: AbortSignal,
   ) => Promise<{
     connectUrl?: string;
     connection?: RunnerProcessConnection;
@@ -3030,6 +3033,20 @@ function acpxProviderPackageAuthority(
       basename(resolve(cliDirectory, "../..")) === "vendor" &&
       basename(resolve(cliDirectory, "../../..")) === "dist") {
     const serverRoot = resolve(cliDirectory, "../../../..");
+    const workspaceRoot = dirname(serverRoot);
+    // Source/Docker builds share the workspace's pnpm store. Published npm
+    // bundles and self-rooted pnpm deployments retain their server authority.
+    if (basename(serverRoot) === "server" &&
+        !existsSync(resolve(serverRoot, "node_modules/.pnpm")) &&
+        existsSync(resolve(workspaceRoot, "node_modules/.pnpm")) &&
+        existsSync(resolve(workspaceRoot, "pnpm-workspace.yaml")) &&
+        existsSync(resolve(workspaceRoot, "package.json"))) {
+      const workspace = JSON.parse(readFileSync(resolve(workspaceRoot, "package.json"), "utf8"));
+      const server = JSON.parse(readFileSync(resolve(serverRoot, "package.json"), "utf8"));
+      if (workspace.name === "paperclip" && workspace.private === true && server.name === "@paperclipai/server") {
+        return { root: workspaceRoot, manifest: resolve(serverRoot, "package.json") };
+      }
+    }
     return { root: serverRoot, manifest: resolve(serverRoot, "package.json") };
   }
   if (
@@ -3534,6 +3551,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #deferredTurnStartEvents: DurableRecoveryCommittedEvent[] = [];
   #recoveryTurnBindingPending = false;
   #threadId = "";
+  #observedProviderModel: string | undefined;
   #sessionId: string | null = null;
   #providerIdentity: Record<string, unknown> | null = null;
   #turnControls: NativeTurnControlCapabilities = { steering: false, queuedFollowUp: false };
@@ -3579,7 +3597,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #authorizedTools: Record<string, unknown> | null = null;
   #runAttachTemplate: Record<string, unknown> | null = null;
   #closed = false;
+  readonly #closedSignal: Promise<void>;
+  #resolveClosedSignal!: () => void;
   #closePromise: Promise<void> | null = null;
+  #startupOperation: Promise<unknown> | null = null;
+  #startupDrainTimedOut = false;
   #controllerDetachedForRestart = false;
   #failure: Error | null = null;
   readonly #failureSignal: Promise<never>;
@@ -3615,6 +3637,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     this.#failureSignal = new Promise<never>((_resolve, reject) => {
       this.#rejectFailureSignal = reject;
+    });
+    this.#closedSignal = new Promise<void>(resolve => {
+      this.#resolveClosedSignal = resolve;
     });
     // Failure is also observed by request/notification paths. Register an
     // internal handler so a process exit after the owner has closed the
@@ -3692,7 +3717,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       throw new Error("native_runner_warm_transition_completion_pending");
     }
     if (method === "initialize") return { user: {} };
-    if (method === "thread/start") return this.#start(params);
+    if (method === "thread/start") return this.#trackStartup(() => this.#start(params));
     if (method === "collaborationMode/list") {
       // runnerd negotiates the real Codex preset or the provider-proxy-owned
       // planning contract during session.open. This transport-level mask
@@ -3791,8 +3816,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     if (method === "thread/read") {
       if (this.#core === null) {
-        this.#recoveryTurnBindingPending = true;
-        await this.#resume();
+        await this.#trackStartup(() => {
+          this.#recoveryTurnBindingPending = true;
+          return this.#resume();
+        });
       }
       // Ask the authenticated runner for its live provider snapshot rather
       // than reading its filesystem. This both supports remote process owners
@@ -4406,6 +4433,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#closed) return;
     this.#controllerDetachedForRestart = true;
     this.#closed = true;
+    this.#resolveClosedSignal();
     this.#turnStartAdmission?.resolve(false);
     if (this.#pump !== null) clearInterval(this.#pump);
     this.#pump = null;
@@ -4432,8 +4460,41 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     );
   }
 
+  #trackStartup<T>(start: () => Promise<T>): Promise<T> {
+    if (this.#startupOperation !== null) {
+      return Promise.reject(new Error("PRP provider thread is already started"));
+    }
+    const operation = Promise.resolve().then(() => {
+      this.#assertStartupOpen();
+      return start();
+    });
+    this.#startupOperation = operation;
+    return operation;
+  }
+
+  #assertStartupOpen(): void {
+    if (this.#closed) throw new Error("runnerd transport closed during provider startup");
+  }
+
   async #closeOnce(): Promise<void> {
     this.#closed = true;
+    this.#resolveClosedSignal();
+    const { preparationDeadline, closeDeadline } = runnerCloseDeadlines(Date.now(), runnerCloseGraceMs(this.options));
+    let startupConfirmed = true;
+    if (this.#startupOperation !== null) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          this.#startupOperation.catch(() => undefined),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error("Native startup drain timed out")), Math.max(0, preparationDeadline - Date.now()));
+          }),
+        ]);
+      } catch {
+        startupConfirmed = false;
+        this.#startupDrainTimedOut = true;
+      } finally { clearTimeout(timer); }
+    }
     this.#turnStartAdmission?.resolve(false);
     const adoptedRunner = this.options.adoptExistingRunner;
     // `settled` is a durable-state assertion, not merely the absence of a
@@ -4458,10 +4519,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // A terminal provider frame can become visible one control loop before
       // its durable provider suffix is ACKed. Drain it before suspension so a
       // fresh run authority never inherits the prior run's pending events.
-      const { preparationDeadline, closeDeadline } = runnerCloseDeadlines(
-        Date.now(),
-        runnerCloseGraceMs(this.options),
-      );
+
       if (!(await this.#runnerHasExited())) {
         // Let an already-admitted tool result reach its original provider
         // before turn.stop can retire that tool-call identity. This shares the
@@ -4588,7 +4646,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     // an incomplete or identity-conflicting state remains fail-closed.
     const finalProviderState = this.#providerDrainState();
     const runnerSettled =
-      runnerSuspended &&
+      startupConfirmed && runnerSuspended &&
       providerDrained &&
       this.#core?.semanticToolResultsSettled() === true &&
       (finalProviderState === null ||
@@ -4639,6 +4697,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         // Keep the settlement failure authoritative if its observer fails.
       }
       throw new NativeSessionCloseUnrecoverableError(settlement);
+    }
+    if (!startupConfirmed) {
+      throw new Error("Native runner startup cleanup is unconfirmed; recovery state retained.");
     }
     if (this.#ownsRoot && !adoptedRunner) {
       rmSync(this.#root, { recursive: true, force: true });
@@ -4733,6 +4794,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }
+    this.#assertStartupOpen();
     const opencodeProxyPath =
       this.options.opencodeProxyPath ??
       (provider === "opencode" && !this.options.runnerFilesystemRoot
@@ -4991,6 +5053,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                   externallySandboxed:
                     provider === "codex" &&
                     this.options.externallySandboxed === true,
+                  ...(provider === "codex" && params.permissions === "paperclip-runner-workspace-read-only" ? { readOnly: true } : {}),
                   instructions:
                     provider === "codex"
                       ? withCodexCollaborationRuntimeInstructions(
@@ -5031,6 +5094,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#controlPlaneCheckpoint = registration.checkpoint ?? null;
       this.#controlPlaneRelease = registration.release;
     }
+    if (this.#closed && this.#startupDrainTimedOut) {
+      const release = this.#controlPlaneRelease;
+      this.#controlPlaneRelease = null;
+      await release?.();
+    }
+    this.#assertStartupOpen();
     const admissionDeadline = this.#coldAdmissionDeadline();
     const handle = spawnRunner({
       connection: registration?.connection ?? {
@@ -5073,7 +5142,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#handle = handle;
     this.#watchRunner(handle);
     await this.#publishSpawnedProcess(handle);
+    this.#assertStartupOpen();
     await registration?.activate?.();
+    this.#assertStartupOpen();
     if (registration?.failure) {
       void registration.failure.catch((error: unknown) => {
         this.#failTransport(
@@ -5082,6 +5153,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       });
     }
     await this.#awaitRegistrationReady(registration?.ready);
+    this.#assertStartupOpen();
     this.#evidence.runnerPid = handle.child.pid ?? null;
     this.#evidence.runnerProcessGroupId = handle.processGroupId ?? null;
     this.#publish();
@@ -5098,6 +5170,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const provider = this.options.provider ?? "codex";
     const acpxAgent = this.options.acpxAgent ?? "codex";
     return {
+      ...(provider === "codex" ? { model: this.#observedProviderModel } : {}),
       thread: {
         id: this.#threadId,
         sessionId: this.#sessionId,
@@ -5535,6 +5608,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     >;
     let oldTransitionRegistration: RecoveryRegistration | null = null;
     let newTransitionRegistration: RecoveryRegistration | null = null;
+    this.#assertStartupOpen();
     if (warmRecovery && this.options.controlPlaneRegistration) {
       try {
         oldTransitionRegistration = await this.options.controlPlaneRegistration(
@@ -5553,6 +5627,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             "native_runner_warm_transition_registered_endpoint_mismatch",
           );
         }
+        this.#assertStartupOpen();
         newTransitionRegistration = await this.options.controlPlaneRegistration(
           core,
           warmRecovery.proof.receipt.newIdentity,
@@ -5607,6 +5682,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             }
           : registration.release;
     }
+    if (this.#closed && this.#startupDrainTimedOut) {
+      const release = this.#controlPlaneRelease;
+      this.#controlPlaneRelease = null;
+      await release?.();
+    }
+    this.#assertStartupOpen();
     // Route and immutable endpoint admission precedes every launch-material
     // write. A refused transition leaves its retained home/context untouched.
     if (runtimeContext !== null) {
@@ -5622,6 +5703,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await releaseMaterializedNativeRuntimeSkills(
         resolve(localCodexHome, "skills"),
       );
+      this.#assertStartupOpen();
       await prepareIsolatedCodexHome({
         context: sourceRuntimeContext,
         codexHome: localCodexHome,
@@ -5638,6 +5720,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (warmRecovery) {
       await this.options.authorizeWarmTransitionRecovery?.("before_bootstrap");
     }
+    this.#assertStartupOpen();
     const bootstrapTicket = adoptedRunner
       ? null
       : warmRecovery
@@ -5653,6 +5736,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await this.options.authorizeWarmTransitionRecovery?.("before_spawn");
     }
     // A replacement executor restores its cold provider before acknowledging recovery.
+    this.#assertStartupOpen();
     const admissionDeadline = this.#coldAdmissionDeadline(adoptedRunner === undefined);
     const handle = adoptedRunner
       ? null
@@ -5698,10 +5782,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#watchRunner(handle);
       await this.#publishSpawnedProcess(handle);
     }
+    this.#assertStartupOpen();
     if (oldTransitionRegistration && newTransitionRegistration) {
       await oldTransitionRegistration.activate?.();
+      this.#assertStartupOpen();
       await newTransitionRegistration.activate?.();
     } else await registration?.activate?.();
+    this.#assertStartupOpen();
     if (registration?.failure) {
       void registration.failure.catch((error: unknown) => {
         this.#failTransport(
@@ -5710,6 +5797,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       });
     }
     if (!adoptedRunner) await this.#awaitRegistrationReady(registration?.ready);
+    this.#assertStartupOpen();
     if (adoptedRunner) {
       this.#evidence.runnerPid = adoptedRunner.pid;
       this.#evidence.runnerProcessGroupId = adoptedRunner.processGroupId;
@@ -5726,6 +5814,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         !recoveryIdentityMatches(core.store.state.identity, desiredIdentity) ||
         core.store.state.warmTransition !== undefined
       ) {
+        this.#assertStartupOpen();
         if (Date.now() >= deadline || (await this.#runnerHasExited())) {
           throw new Error("native_runner_warm_transition_recovery_pending");
         }
@@ -5740,11 +5829,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#deferredTurnStartEvents = [];
       if (oldTransitionRegistration && newTransitionRegistration) {
         await oldTransitionRegistration.release();
+        this.#assertStartupOpen();
         this.#controlPlaneRelease = newTransitionRegistration.release;
         this.#controlPlaneCheckpoint =
           newTransitionRegistration.checkpoint ?? null;
       }
     }
+    this.#assertStartupOpen();
     this.#pump = setInterval(() => this.#pumpEventsSafely(), 5);
     if (adoptedRunner) {
       await this.#awaitAdoptedRunnerConnection(
@@ -5935,6 +6026,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         "turn.start",
         {
           text: message,
+          ...((this.options.provider ?? "codex") === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
           ...(reasoningMode === undefined ? {} : { reasoningMode }),
           ...(skills.length ? { skills } : {}),
           turnId: pendingTurnId,
@@ -6565,6 +6657,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const started = record(record(event.envelope.payload).payload);
     const runtimeIdentity = record(started.runtimeIdentity);
     const descriptor = record(started.providerDescriptor);
+    if (typeof descriptor.effectiveModel === "string" && descriptor.effectiveModel.trim()) this.#observedProviderModel = descriptor.effectiveModel;
     const {
       processId: pid,
       threadId,
@@ -6780,8 +6873,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await awaitAdoptedRunnerAuthentication({
         activeConnectionCount: () => core.activeRunnerConnectionCount(),
         isAlive: () => adoptedRunner.isAlive(),
-        throwIfFailed: () => this.#throwIfFailed(),
-        failure: this.#failureSignal,
+        throwIfFailed: () => { this.#assertStartupOpen(); this.#throwIfFailed(); },
+        failure: Promise.race([
+          this.#failureSignal,
+          this.#closedSignal.then(() => { throw new Error("runnerd transport closed during provider startup"); }),
+        ]),
         ready,
         timeoutMs: this.options.runnerReconnectGraceMs ?? 30_000,
       });
@@ -6790,6 +6886,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#failTransport(failure);
       throw failure;
     }
+    this.#assertStartupOpen();
     this.#adoptedRunnerAuthenticated = true;
     this.#diagnostic(
       `adopted runner ${adoptedRunner.pid} authenticated to its durable PRP authority`,
@@ -6994,11 +7091,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #awaitRegistrationReady(
     ready: (() => Promise<void>) | undefined,
   ): Promise<void> {
+    this.#assertStartupOpen();
     if (ready === undefined) {
       this.#throwIfFailed();
       return;
     }
-    await Promise.race([ready(), this.#failureSignal]);
+    await Promise.race([
+      ready(), this.#failureSignal,
+      this.#closedSignal.then(() => { this.#assertStartupOpen(); }),
+    ]);
+    this.#assertStartupOpen();
     this.#throwIfFailed();
   }
 
@@ -7015,13 +7117,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 }
 
-export function defaultCapabilityRunnerdBinary(): string {
+export function defaultCapabilityRunnerdBinary(platform = process.platform, architecture = process.arch): string {
   // Standalone builds use dist/live; the server vendors that compiled tree
   // directly under vendor/paperclip-runner. Resolve beside our own live module.
   const outputRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
-  const staged = resolvePackagedRunnerBinary(outputRoot)
-    ?? resolvePackagedRunnerBinary(resolve(packageRoot, "dist"));
+  const staged = resolvePackagedRunnerBinary(outputRoot, platform, architecture)
+    ?? resolvePackagedRunnerBinary(resolve(packageRoot, "dist"), platform, architecture);
   if (staged) return staged;
+  if (platform !== process.platform || architecture !== process.arch) {
+    throw new Error(`runner_remote_artifact_unavailable: install the Paperclip release containing the ${platform}-${architecture} daemon or configure PAPERCLIP_RUNNER_REMOTE_BINARY_PATH`);
+  }
   return resolve(
     packageRoot,
     `runner/target/debug/paperclip-runnerd${executableSuffix}`,
@@ -7042,6 +7147,194 @@ export function createCapabilityRunnerdCodexTransport(
 
 export const createRunnerdCodexTransport =
   createCapabilityRunnerdCodexTransport;
+
+export async function probeNativeRunnerEnvironment(options: {
+  runtimeDirectory: string;
+  provider: "codex";
+  model: string | null;
+  reasoningEffort?: string;
+  environment: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  workingDirectory?: string;
+  transportOptions?: CapabilityRunnerdCodexTransportOptions;
+  onCodexCredentialRefresh?: (filename: string) => Promise<void>;
+  onCleanupConfirmed?: () => Promise<void>;
+}): Promise<{
+  provider: "codex";
+  providerDriver: string;
+  effectiveModel: string;
+  helloProbePassed: true;
+}> {
+  const environment = { ...options.environment };
+  const remoteFilesystemRoot = options.transportOptions?.runnerFilesystemRoot;
+  if (options.workingDirectory !== undefined && !remoteFilesystemRoot) throw new Error("Native setup remote working directory requires a remote runner filesystem.");
+  const workingDirectory = options.workingDirectory ?? resolve(options.runtimeDirectory, "workspace");
+  if (!remoteFilesystemRoot) mkdirSync(workingDirectory, { mode: 0o700 });
+  const controller = new AbortController();
+  let registrationTeardownError: unknown;
+  let registrationOperation: Promise<unknown> | undefined;
+  let registrationCleanupConfirmed = true;
+  const sourceCodexHome = options.transportOptions?.sourceCodexHome ?? resolveSourceCodexHome(environment);
+  delete environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX;
+  environment.HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "probe-home");
+  environment.CODEX_HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "codex-home");
+  environment.PAPERCLIP_WORKSPACE_CWD = workingDirectory;
+  const bundle = createRunnerdCodexTransport({
+    ...options.transportOptions,
+    ...(options.transportOptions?.controlPlaneRegistration ? { controlPlaneRegistration: (authority, identity) => {
+      const operation = (async () => {
+        controller.signal.throwIfAborted();
+        registrationCleanupConfirmed = false;
+        const registration = await options.transportOptions!.controlPlaneRegistration!(authority, identity, controller.signal);
+        let releaseOperation: Promise<void> | undefined;
+        const release = () => releaseOperation ??= Promise.resolve()
+          .then(() => registration.release())
+          .then(() => { registrationCleanupConfirmed = true; }, error => {
+            registrationTeardownError = error;
+            throw error;
+          });
+        if (controller.signal.aborted) {
+          await release();
+          controller.signal.throwIfAborted();
+        }
+        return { ...registration, release };
+      })();
+      registrationOperation = operation;
+      return operation;
+    } } : {}),
+    ...(options.transportOptions?.runnerProcessLauncher ? { runnerProcessLauncher: spec => {
+      controller.signal.throwIfAborted();
+      return options.transportOptions!.runnerProcessLauncher!(spec);
+    } } : {}),
+    provider: options.provider,
+    sourceCodexHome: sourceCodexHome ?? "",
+    stateDirectory: options.runtimeDirectory,
+    environment,
+    externallySandboxed: false,
+    closeGraceMs: 10_000,
+    lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+  });
+  const driver = new CodexAppServerDriver({
+    taskEnvelope: {
+      schema: "paperclip.skillless_task.v1", objective: "Verify the selected native account and model.",
+      completionContract: { revision: "environment-probe-v1", criteria: [] },
+      constraints: [], expectedResultSchema: "paperclip.run_result.v1",
+    },
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    conversationMode: "direct",
+    requestedCollaborationMode: "plan",
+    approvalPolicy: "never",
+    includeCollaborationModeInstructions: false,
+    dynamicTools: [],
+    environment,
+    transportFactory: () => bundle.transport,
+    requireProviderSessionIdentity: true,
+    ...(remoteFilesystemRoot ? { workingDirectoryAuthority: "remote_runner" as const } : {}),
+  });
+  let rejectAborted!: (error: unknown) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject; });
+  const timer = setTimeout(() => {
+    const error = new Error("Native provider hello probe timed out.");
+    controller.abort(error);
+    rejectAborted(error);
+  }, Math.max(1, Math.min(options.timeoutMs ?? 45_000, 120_000)));
+  let session: HarnessSession | undefined;
+  let completed = false;
+  let effectiveModel: string | undefined;
+  let failure: unknown;
+  const operation = (async () => {
+    session = await driver.openSession({ runId: "environment-probe", normalizedSessionId: "environment-probe",
+      workingDirectory, signal: controller.signal });
+    controller.signal.throwIfAborted();
+    const ids = session.ids();
+    const expectedDriver = "codex_app_server";
+    if (!ids.driverSessionId || !ids.providerSessionId || bundle.evidence().providerDriver !== expectedDriver) {
+      throw new Error(`The native environment probe returned no matching provider identity (${bundle.evidence().providerDriver ?? "missing driver"}).`);
+    }
+    const events = session.events()[Symbol.asyncIterator]();
+    const first = await events.next();
+    const context = record(first.value?.payload.context);
+    if (first.value?.eventType !== "session.started" || !context.model || record(record(context.sandbox).permissionProfile).id !== "paperclip-runner-workspace-read-only") {
+      throw new Error("The native environment probe returned no observed model or read-only runtime identity.");
+    }
+    {
+      effectiveModel = typeof context.model === "string" && context.model.trim() && context.model !== "unknown" ? context.model : undefined;
+      if (!effectiveModel || (options.model !== null && effectiveModel !== options.model)) throw new Error("The selected native runtime returned a missing or mismatched provider model.");
+    }
+    controller.signal.throwIfAborted();
+    const { turnId } = await session.startTurn({ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." } });
+    let responseObserved = false;
+    while (true) {
+      const next = await events.next();
+      if (next.done) break;
+      const event = next.value;
+      if (event.turnId !== turnId) continue;
+      if (event.eventType === "item.completed" && event.payload.kind === "agentMessage"
+        && typeof event.payload.text === "string" && event.payload.text.trim()) {
+        responseObserved = true;
+      }
+      if (event.eventType === "turn.completed") {
+        if (!responseObserved || !effectiveModel) throw new Error("The native provider hello probe returned no response or observed model.");
+        completed = true;
+        return;
+      }
+      if (event.eventType === "turn.failed" || event.eventType === "turn.interrupted" || event.eventType === "turn.cancelled") {
+        const detail = record(event.payload.error).message;
+        throw new Error(typeof detail === "string" ? detail : "The native provider hello probe failed.");
+      }
+    }
+    throw new Error("The native provider hello probe ended without a successful turn.");
+  })();
+  try {
+    await Promise.race([operation, aborted]);
+  } catch (error) {
+    failure = error;
+  } finally {
+    clearTimeout(timer);
+    controller.abort(failure ?? new Error("Native provider hello probe complete."));
+    const teardownErrors: unknown[] = [];
+    const teardownDeadline = Date.now() + 10_000;
+    const awaitTeardown = async (pending: Promise<unknown>, detail: string): Promise<void> => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          pending,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error(`Native setup probe cleanup timed out while ${detail}; recovery state retained.`)), Math.max(0, teardownDeadline - Date.now()));
+          }),
+        ]);
+      } finally { clearTimeout(timeout); }
+    };
+    try {
+      await awaitTeardown(session ? session.close({ reason: "environment probe complete" }) : bundle.transport.close("environment probe complete"), "closing the selected runtime");
+      if (bundle.evidence().runnerPid !== null && !bundle.evidence().runnerExited) throw new Error("Native setup probe cleanup is incomplete.");
+    } catch (error) { teardownErrors.push(error); }
+    try { await awaitTeardown(operation.catch(() => undefined), "draining native setup"); }
+    catch (error) { teardownErrors.push(error); }
+    if (registrationOperation) {
+      try { await awaitTeardown(registrationOperation.catch(() => undefined), "draining authority registration"); }
+      catch (error) { teardownErrors.push(error); }
+    }
+    if (registrationTeardownError !== undefined && !teardownErrors.includes(registrationTeardownError)) teardownErrors.push(registrationTeardownError);
+    if (!registrationCleanupConfirmed) teardownErrors.push(new Error("Native setup probe authority release is unconfirmed; recovery state retained."));
+    if (bundle.evidence().runnerPid !== null && bundle.evidence().runnerExited && options.provider === "codex" && options.onCodexCredentialRefresh) {
+      try { await options.onCodexCredentialRefresh(resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "codex-home", "auth.json")); }
+      catch (error) { teardownErrors.push(error); }
+    }
+    if (!teardownErrors.length && options.onCleanupConfirmed) {
+      try { await options.onCleanupConfirmed(); }
+      catch (error) { teardownErrors.push(error); }
+    }
+    if (teardownErrors.length) {
+      const errors = [...(failure === undefined ? [] : [failure]), ...teardownErrors];
+      throw new AggregateError(errors, errors.map(error => error instanceof Error ? error.message : "Native probe cleanup failed.").join("; "), { cause: failure ?? teardownErrors[0] });
+    }
+  }
+  if (failure !== undefined) throw failure;
+  if (!completed) throw new Error("The native provider hello probe did not complete.");
+  return Object.freeze({ provider: options.provider, providerDriver: bundle.evidence().providerDriver!, effectiveModel: effectiveModel!, helloProbePassed: true });
+}
 
 /** The transport provider identifies the biller, independently of model family. */
 function openedThreadModelProvider(

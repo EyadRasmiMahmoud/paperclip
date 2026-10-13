@@ -154,6 +154,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
     };
     const recoveryOptions: HarnessSessionRecoveryOptions = {
       signal: options.signal,
+      normalizeReplayPayload: options.normalizeReplayPayload,
     };
     const recovered = await this.#driver.recoverSession(
       persisted,

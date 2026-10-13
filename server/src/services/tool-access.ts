@@ -1,4 +1,5 @@
 import { chatCredentialMutationLease } from "./chat-credential-mutation-lease.js";
+import { notifyChatEndpointWork } from "./chat-work-notifications.js";
 import { removeSlackRegistration } from "./chat-slack-registration-cleanup.js";
 import { chatEndpoints } from "@paperclipai/db";
 import { AGGREGATOR_NAMES, isAppAggregator, type AggregatorAppsResponse, type ArcadeDiscoverySetupInput } from "@paperclipai/shared/aggregator-apps";
@@ -19047,7 +19048,7 @@ export function toolAccessService(
         ...(input.credentialRefs ?? existing.credentialRefs),
         ...(input.credentialSecretRefs ?? existing.credentialSecretRefs),
       ]);
-      const [row] = await db
+      const write = (database: Db) => database
         .update(toolConnections)
         .set({
           name: input.name ?? existing.name,
@@ -19066,7 +19067,17 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connectionId))
         .returning();
-      await syncCredentialBindings(row);
+      const [row] = existing.transport === "chat_sdk"
+        ? await db.transaction(async tx => {
+            await notifyChatEndpointWork(tx, existing.id);
+            const rows = await write(tx as unknown as Db);
+            // Credential resolution must never observe the binding rebuild's
+            // delete/insert gap after a configuration wake.
+            await syncCredentialBindings(rows[0]!, [], tx);
+            return rows;
+          })
+        : await write(db);
+      if (existing.transport !== "chat_sdk") await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       emitConnectionUpdated(row, existing, "api");
       return toConnection(row);

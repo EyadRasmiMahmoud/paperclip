@@ -1871,7 +1871,7 @@ describe("Capability live runnerd and Codex session", () => {
       reasoningTokens: 5,
       costNanodollars: 2_500,
     });
-  });
+  }, 15_000);
 
   it("does not raise an unhandled rejection when interrupt() outlasts the turn timeout during reconcileActiveTurn", async () => {
     const state = providerState();

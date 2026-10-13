@@ -25,6 +25,12 @@ function isControlRequest(req: Request) {
 
 /** Install before body parsers, auth, webhooks and tool ingress. */
 export const idleAdmissionMiddleware: RequestHandler = (req, res, next) => {
+  // This exact route is synchronous and has no auth, SQL, or accepted work.
+  // Probing it must not prevent an otherwise quiescent instance from draining.
+  if (req.path.replace(/\/$/, "") === "/api/liveness" && ["GET", "HEAD"].includes(req.method)) {
+    next();
+    return;
+  }
   const controlRequest = isControlRequest(req);
   if (!controlRequest && isIdleTaskDrainActive()) {
     res.set("Retry-After", "1").status(503).json({ error: "instance_preparing_to_sleep" });

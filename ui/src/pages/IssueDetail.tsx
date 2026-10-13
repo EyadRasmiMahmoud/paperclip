@@ -2497,7 +2497,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             blockerAttention={blockerAttention}
             successfulRunHandoff={successfulRunHandoff}
             scheduledRetry={scheduledRetry}
-            recoveryAction={recoveryAction ?? null}
+            recoveryAction={recoveryAction?.cause === "native_workspace_finalization_owner_unverified" ? null : recoveryAction ?? null}
             onResolveRecoveryAction={onResolveRecoveryAction}
             onReissueIsolatedRecoveryAction={onReissueIsolatedRecoveryAction}
             reissueIsolatedRecoveryActionPending={
@@ -3850,14 +3850,22 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     [issue],
   );
 
+  const { data: assignmentActivity } = useQuery({
+    queryKey: queryKeys.issues.activity(issueId!),
+    queryFn: () => activityApi.forIssue(issueId!),
+    enabled: Boolean(issueId && currentUserId && issue?.assigneeUserId === currentUserId),
+  });
+
   const suggestedAssigneeValue = useMemo(
     () =>
       suggestedCommentAssigneeValue(
         issue ?? {},
         mergeIssueComments(comments ?? [], optimisticComments),
         currentUserId,
+        undefined,
+        assignmentActivity,
       ),
-    [issue, comments, optimisticComments, currentUserId],
+    [issue, comments, optimisticComments, currentUserId, assignmentActivity],
   );
 
   const threadComments = useMemo(
@@ -7644,6 +7652,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           <ExternallyConnectedTaskBanner
             className={cn(shellSectionClass, "mt-3")}
             key={issue.id}
+            assigneeAgentId={issue.assigneeAgentId}
             attachments={attachments ?? []}
             companyId={issue.companyId}
             issueId={issue.id}
@@ -7651,12 +7660,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           />
 
           {resolvedDetailTab === "chat" && (
-            <WorkspaceExportRecovery key={`workspace-export:${issue.activeRecoveryAction?.id ?? issue.id}`} issueId={issue.id}
+            <WorkspaceExportRecovery key={`workspace-export:${issue.activeRecoveryAction?.id ?? issue.id}`}
               className={shellSectionClass}
-              action={issue.activeRecoveryAction ?? null} canManage={canManageBoardRuntime} onQueued={invalidateIssueDetail} />
+              action={issue.activeRecoveryAction ?? null} />
           )}
           {resolvedDetailTab === "chat" && issue.executionBlocker && (
-            <ExecutionBlockerNotice className={shellSectionClass} companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
+            <ExecutionBlockerNotice className={shellSectionClass} companyId={issue.companyId} issueId={issue.id}
+              issueStatus={issue.status} canManage={canManageBoardRuntime && canResolveBoardRecoveryAction}
+              blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
           )}
 
           {issue.status === "in_review" && issue.externalConversationState === "waiting" && (
@@ -8038,7 +8049,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   blockerAttention={issue.blockerAttention ?? null}
                   successfulRunHandoff={issue.successfulRunHandoff ?? null}
                   scheduledRetry={issue.scheduledRetry ?? null}
-                  recoveryAction={issue.activeRecoveryAction ?? null}
+                  recoveryAction={issue.activeRecoveryAction?.cause === "native_workspace_finalization_owner_unverified" ? null : issue.activeRecoveryAction ?? null}
                   onResolveRecoveryAction={handleResolveRecoveryAction}
                   onReissueIsolatedRecoveryAction={
                     handleReissueIsolatedRecoveryAction

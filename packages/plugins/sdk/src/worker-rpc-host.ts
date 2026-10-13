@@ -39,6 +39,7 @@ import { createPluginIdleDrain } from "./idle-drain.js";
  * @see PLUGIN_SPEC.md §14 — SDK Surface
  */
 
+import type { ResourceLifecycleEvent } from "./types.js";
 import fs from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
@@ -1660,6 +1661,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         return handleExecuteTool(params as ExecuteToolParams);
       case "detectExternalObjects":
         return handleDetectExternalObjects(params as DetectExternalObjectsParams);
+      case "resourceLifecycle":
+        if (!plugin.definition.onResourceLifecycle) throw methodNotImplemented("resourceLifecycle");
+        return plugin.definition.onResourceLifecycle(params as ResourceLifecycleEvent);
       case "agentLifecycle":
         if (!plugin.definition.onAgentLifecycle) throw methodNotImplemented("agentLifecycle");
         return plugin.definition.onAgentLifecycle(params as AgentLifecycleRequest);
@@ -1783,6 +1787,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onIdleDrain) supportedMethods.push("prepareIdleSleep", "releaseIdleSleep");
     if (plugin.definition.onApiRequest) supportedMethods.push("handleApiRequest");
     if (plugin.definition.onDetectExternalObjects) supportedMethods.push("detectExternalObjects");
+    if (plugin.definition.onResourceLifecycle) supportedMethods.push("resourceLifecycle");
     if (plugin.definition.onAgentLifecycle) supportedMethods.push("agentLifecycle");
     if (plugin.definition.onRouteAiConnection) supportedMethods.push("routeAiConnection");
     if (plugin.definition.onResolveExternalObject) supportedMethods.push("resolveExternalObject");

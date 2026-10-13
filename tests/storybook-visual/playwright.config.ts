@@ -47,9 +47,9 @@ export default defineConfig({
     // JS-driven tickers/timers key off prefers-reduced-motion for
     // deterministic captures (CSS animations are already disabled).
     reducedMotion: "reduce",
-    baseURL: "http://localhost:6106",
+    baseURL: process.env.STORYBOOK_TEST_BASE_URL ?? "http://localhost:6106",
   },
-  webServer: {
+  webServer: process.env.STORYBOOK_TEST_BASE_URL ? undefined : {
     command: "node ../../scripts/serve-storybook-static.mjs --port 6106",
     url: "http://localhost:6106/index.json",
     reuseExistingServer: true,

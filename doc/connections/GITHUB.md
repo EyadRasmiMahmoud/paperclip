@@ -52,6 +52,12 @@ contains those optional agent permissions. Scheduling filters, ignored files,
 and inline-comment options have separate disclosures. The header shows the App
 identity, copyable mention, avatar download, and GitHub branding settings.
 
+Published review summaries use the GitHub bot's display name in their heading.
+The check name remains **Paperclip Review**. Multiple bots can review the same
+PR through separate GitHub Apps: each keeps its own task, summary, findings, and
+check. Check updates match both the App ID and the endpoint/PR/commit identity.
+Repository branch rules decide separately which App's check is required to merge.
+
 ## Self-hosted setup
 
 The setup screen states the default access in one line, with **Change** for

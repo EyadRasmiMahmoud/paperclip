@@ -1,3 +1,4 @@
+import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -267,6 +268,7 @@ export interface PreparedAdapterExecutionTargetRuntime {
   workspaceSyncSnapshot: {
     baseline: DirectorySnapshot;
     gitSnapshot: GitWorkspaceSnapshot | null;
+    repositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   } | null;
   cleanupWorkspaceSnapshot?(): Promise<void>;
   restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
@@ -278,6 +280,9 @@ export interface AdapterExecutionTargetProcessOptions {
   stdin?: string;
   timeoutSec: number;
   graceSec: number;
+  /** Sandbox-only: request the provider's persistent process session for a
+   * long-lived command. The host still gates this on provider capabilities. */
+  useSession?: boolean;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
@@ -881,6 +886,8 @@ export async function runAdapterExecutionTargetProcess(
         env,
         stdin: options.stdin,
         timeoutMs: options.timeoutSec > 0 ? options.timeoutSec * 1000 : target.timeoutMs ?? undefined,
+        ...(options.useSession !== undefined ? { useSession: options.useSession } : {}),
+        ...(options.useSession === true ? { commandTimeoutMs: Math.max(0, options.timeoutSec) * 1000 } : {}),
         // The tail loop already streams incremental chunks; suppress the
         // runner's end-of-run batched onLog to avoid duplicate log bytes.
         onLog: runLogTail ? undefined : options.onLog,
@@ -1433,10 +1440,14 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
+  workspaceCheckpoint?: boolean;
+  onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  workspaceSeedCacheDirectory?: string;
+  workspaceSeedCacheCompanyDirectory?: string;
   workspaceBaseline?: DirectorySnapshot;
   workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
+  workspaceRepositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   workspaceExclude?: string[];
-  /** Plain persistent directories include all files, independent of Git and task cache exclusions. */
   workspaceFileMode?: "all";
   preserveAbsentOnRestore?: string[];
   assets?: AdapterManagedRuntimeAsset[];
@@ -1456,6 +1467,11 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   // so the host pack time rides one `pack` span under the `stage.sync` step. The
   // SSH and local lanes ignore it. The default is a no-op.
   runtimeSpan?: RuntimeSpanRunner;
+  /**
+   * Sandbox copy-back retry delays. Environment probes restore into a throwaway
+   * temp workspace and pass `[]` so a failed restore does not stall the Test.
+   */
+  workspaceRestoreRetryDelaysMs?: readonly number[];
 }): Promise<PreparedAdapterExecutionTargetRuntime> {
   const target = input.target ?? { kind: "local" as const };
   if (target.kind === "local") {
@@ -1518,8 +1534,13 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     syncWorkspace: input.syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,
     workspaceDurableSeed: input.workspaceDurableSeed,
+    workspaceCheckpoint: input.workspaceCheckpoint,
+    onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+    workspaceSeedCacheDirectory: input.workspaceSeedCacheDirectory,
+    workspaceSeedCacheCompanyDirectory: input.workspaceSeedCacheCompanyDirectory,
     workspaceBaseline: input.workspaceBaseline,
     workspaceGitSnapshot: input.workspaceGitSnapshot,
+    workspaceRepositories: input.workspaceRepositories,
     workspaceExclude: input.workspaceExclude,
     workspaceFileMode: input.workspaceFileMode,
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
@@ -1530,6 +1551,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     onProgress: input.onProgress,
     onRuntimeProgress: input.onRuntimeProgress,
     runtimeSpan: input.runtimeSpan,
+    workspaceRestoreRetryDelaysMs: input.workspaceRestoreRetryDelaysMs,
   });
   return {
     target,

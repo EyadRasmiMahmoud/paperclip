@@ -57,6 +57,7 @@ export interface OpenHarnessSessionInput {
 }
 
 export interface HarnessSessionRecoveryOptions {
+  normalizeReplayPayload?(payload: PrpEvent["payload"]): PrpEvent["payload"];
   /** Abort provider recovery and release any not-yet-returned provider state. */
   signal: AbortSignal;
 }

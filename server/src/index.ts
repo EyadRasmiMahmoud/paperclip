@@ -1,3 +1,4 @@
+import { skillSourceSyncService } from "./services/skill-source-sync.js";
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
 import type { createDeliveryWorkCoordinator } from "./services/delivery-work-coordinator.js";
@@ -1212,11 +1213,22 @@ async function startServerWithDatabaseTeardown(
     }, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
   };
+  const skillSourceSync = skillSourceSyncService(db as any);
+  const sweepSkillSources = () => {
+    if (isIdleTaskDrainActive() || heartbeatSchedulerStopped || isWarmStandby()) return;
+    trackHeartbeatSchedulerWork(skillSourceSync.tick().catch(err => {
+      logger.error({ err }, "skill source synchronization failed");
+    }));
+  };
+  const skillSourceSyncInterval = setInterval(sweepSkillSources, 5000);
+  skillSourceSyncInterval.unref?.();
+  sweepSkillSources();
   const externalObjects = externalObjectService(db as any, {
     pluginWorkerManager,
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
   });
   const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
+    sweepSkillSources();
     if (isIdleTaskDrainActive() || heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(externalObjects
       .refreshDueObjectsForActiveCompanies(50, now)
@@ -1968,6 +1980,8 @@ async function startServerWithDatabaseTeardown(
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
+    clearInterval(skillSourceSyncInterval);
+    await skillSourceSync.stop();
     unsubscribeChatCompletions();
     await deliveryWork.stop();
     clearInterval(executionControlInterval);

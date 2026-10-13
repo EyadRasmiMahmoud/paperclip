@@ -732,7 +732,7 @@ export type SecretProviderConfigHealthStatus =
 export const SECRET_STATUSES = ["active", "disabled", "archived", "deleted"] as const;
 export type SecretStatus = (typeof SECRET_STATUSES)[number];
 
-export const SECRET_SCOPES = ["company", "user"] as const;
+export const SECRET_SCOPES = ["company", "user", "instance"] as const;
 export type SecretScope = (typeof SECRET_SCOPES)[number];
 
 export const SECRET_MANAGED_MODES = ["paperclip_managed", "external_reference"] as const;

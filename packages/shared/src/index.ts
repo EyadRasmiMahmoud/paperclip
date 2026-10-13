@@ -1268,6 +1268,9 @@ export type {
   BudgetIncidentResolutionInput,
   CostEvent,
   CostSummary,
+  CostDataQualityItem,
+  CostDataQualityReport,
+  CostDataQualityReason,
   IssueCostSummary,
   CostByAgent,
   CostByUser,
@@ -1996,6 +1999,7 @@ export {
   resolveIssueRecoveryActionSchema,
   isValidExistingBranchName,
   retryWorkspaceExportSchema,
+  resumeWorkspaceFinalizationSchema,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -2870,4 +2874,11 @@ export { AGENT_LIFECYCLE_STATES, type AgentLifecycleState, type AgentLifecycleOp
 
 export type { AgentLifecycleRequest, AgentLifecycleResult } from "./types/agent-lifecycle.js";
 
+export * from "./types/task-workspace.js";
+export * from "./validators/task-workspace.js";
+
+export { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository } from "./validators/workspace-repository.js";
+
 export * from "./fast-response.js";
+
+export { HUMAN_TASK_ORIGIN_KINDS, isAgentCreatedIssue, type IssueCreationSourceFields } from "./issue-creation-source.js";
